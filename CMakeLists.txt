@@ -30,7 +30,12 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g" CACHE STRING "" FORCE)
 # resource structs). Build -m32 when the host has multilib; otherwise fall back
 # to -m64 so compile work can proceed.
 set(SMS_ARCH "auto" CACHE STRING "auto, 32 or 64")
-if(SMS_ARCH STREQUAL "auto")
+if(EMSCRIPTEN)
+  # Browser build (docs/WEB_PORT_PLAN.md): wasm32 is ILP32 like the Linux
+  # -m32 build, with 8-byte alignment for s64/f64 as on the GameCube.
+  set(SMS_ARCH 32)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/emscripten.cmake)
+elseif(SMS_ARCH STREQUAL "auto")
   include(CheckCXXSourceCompiles)
   set(CMAKE_REQUIRED_FLAGS "-m32")
   set(CMAKE_REQUIRED_LINK_OPTIONS "-m32")
@@ -44,8 +49,10 @@ if(SMS_ARCH STREQUAL "auto")
     message(WARNING "-m32 does not link here (install gcc-multilib g++-multilib); building -m64")
   endif()
 endif()
-add_compile_options(-m${SMS_ARCH})
-add_link_options(-m${SMS_ARCH})
+if(NOT EMSCRIPTEN)
+  add_compile_options(-m${SMS_ARCH})
+  add_link_options(-m${SMS_ARCH})
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # RUNPATH, not RPATH: a toolchain's library directory (the launcher's conda
   # tools add one to every link) then finds only the game's own libraries.
@@ -121,8 +128,14 @@ endif()
 # Non-PIE: the game's code and data sit at the same addresses every run, which
 # 64-bit builds need for pointers in u32 slots and save states need everywhere
 # (a state holds pointers to the game's vtables and globals).
-if(SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(NOT EMSCRIPTEN AND (SMS_ARCH STREQUAL "64" OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
   list(APPEND SMS_GAME_FLAGS -fno-pie)
+endif()
+if(EMSCRIPTEN)
+  # wasm objects cannot have symbols renamed after compilation (llvm-objcopy
+  # only edits sections for wasm), so the game's operator new/delete get the
+  # __sms_game_* names at compile time instead (see the objcopy step below).
+  list(APPEND SMS_GAME_FLAGS "SHELL:-include ${SMS_PORT_SRC}/port_web_new.h")
 endif()
 # Clang rejects the game's pointer-to-int truncations ((int)ptr, (u32)ptr) as
 # hard errors in C++ where g++ -fpermissive only warns; -fms-extensions turns
@@ -307,11 +320,21 @@ else()
   set(_object_prefix "")
   set(SMS_OBJCOPY objcopy)
 endif()
+if(NOT EMSCRIPTEN)
 file(WRITE ${CMAKE_BINARY_DIR}/game_new_syms.txt
   "${_object_prefix}_Znw${_sz} __sms_game_new\n${_object_prefix}_Zna${_sz} __sms_game_new_array\n${_object_prefix}_ZdlPv __sms_game_delete\n${_object_prefix}_ZdaPv __sms_game_delete_array\n")
 add_custom_command(TARGET sms_game POST_BUILD
   COMMAND ${SMS_OBJCOPY} --redefine-syms=${CMAKE_BINARY_DIR}/game_new_syms.txt $<TARGET_FILE:sms_game>
   COMMENT "Renaming the game's global operator new/delete")
+endif()
+
+# The browser build defines its own executables (web/CMakeLists.txt): the
+# native platform layer below links native-only pieces (crash handlers,
+# --defsym, link maps, objcopy, standalone bundles).
+if(EMSCRIPTEN)
+  add_subdirectory(web)
+  return()
+endif()
 
 # --- Platform layer ---------------------------------------------------------
 file(GLOB_RECURSE SMS_PLATFORM_SOURCES CONFIGURE_DEPENDS

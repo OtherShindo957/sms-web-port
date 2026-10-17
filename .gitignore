@@ -12,3 +12,5 @@
 /mods/*
 !/mods/README.md
 __pycache__/
+# Browser test dependencies (web/tests: npm install).
+node_modules/

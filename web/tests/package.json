@@ -1,0 +1,12 @@
+{
+  "name": "sms-web-tests",
+  "private": true,
+  "description": "Browser tests for the Super Mario Sunshine web build",
+  "type": "module",
+  "scripts": {
+    "smoke": "node smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1"
+  }
+}

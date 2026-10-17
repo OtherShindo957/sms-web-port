@@ -1,0 +1,37 @@
+Reason: Clang (the browser build's Emscripten compiler) rejects an alias declared as an array of unknown size; under __EMSCRIPTEN__ the three retail-name data exports take their definition's complete type with __typeof__. The ELF/COFF and Mach-O spellings are unchanged.
+--- a/src/MoveBG/MapObjInit.cpp
++++ b/src/MoveBG/MapObjInit.cpp
+@@ -10816,6 +10816,9 @@
+ // Code mods (sms_mod/modhooks.h) name this by its retail map name.
+ #if defined(__APPLE__)
+ __asm__(".globl _sObjDataTable\n.set _sObjDataTable, __ZL13sObjDataTable");
++#elif defined(__EMSCRIPTEN__)
++// Clang needs the array's size in an alias declaration: take the definition's type.
++extern __typeof__(sObjDataTable) portExport_sObjDataTable __asm__("sObjDataTable") __attribute__((alias("_ZL13sObjDataTable")));
+ #else
+ extern TMapObjData* portExport_sObjDataTable[] __asm__("sObjDataTable") __attribute__((alias("_ZL13sObjDataTable")));
+ #endif
+--- a/src/Player/MarioDraw.cpp
++++ b/src/Player/MarioDraw.cpp
+@@ -38,6 +38,9 @@
+ // Code mods (sms_mod/modhooks.h) name this by its retail map name.
+ #if defined(__APPLE__)
+ __asm__(".globl _marioAnimeFiles\n.set _marioAnimeFiles, __ZL15marioAnimeFiles");
++#elif defined(__EMSCRIPTEN__)
++// Clang needs the array's size in an alias declaration: take the definition's type.
++extern __typeof__(marioAnimeFiles) portExport_marioAnimeFiles __asm__("marioAnimeFiles") __attribute__((alias("_ZL15marioAnimeFiles")));
+ #else
+ extern unkTMarioAnimeFilesStruct portExport_marioAnimeFiles[] __asm__("marioAnimeFiles") __attribute__((alias("_ZL15marioAnimeFiles")));
+ #endif
+--- a/src/Player/Yoshi.cpp
++++ b/src/Player/Yoshi.cpp
+@@ -64,6 +64,9 @@
+ // Code mods (sms_mod/modhooks.h) name this by its retail map name.
+ #if defined(__APPLE__)
+ __asm__(".globl _bodyColor\n.set _bodyColor, __ZL9bodyColor");
++#elif defined(__EMSCRIPTEN__)
++// Clang needs the array's size in an alias declaration: take the definition's type.
++extern __typeof__(bodyColor) portExport_bodyColor __asm__("bodyColor") __attribute__((alias("_ZL9bodyColor")));
+ #else
+ extern GXColor portExport_bodyColor[] __asm__("bodyColor") __attribute__((alias("_ZL9bodyColor")));
+ #endif

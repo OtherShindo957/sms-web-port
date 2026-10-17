@@ -137,7 +137,7 @@ extern "C" void port_stub_report(void)
 // atos on macOS) so a crash report names functions and source lines without
 // the exact binary at hand. Not async-signal-safe: it runs last, after the
 // rest of the report is written.
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 static void crash_symbolise(void** bt, int n)
 {
 	char exe[512];
@@ -344,7 +344,7 @@ static void crash_handler(int sig)
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
-#else
+#elif !defined(__EMSCRIPTEN__)
 static void crash_handler(int sig, siginfo_t* si, void* uc)
 {
 	// A fault while reporting ends the process with the original signal;
@@ -441,7 +441,7 @@ static void crash_handler(int sig, siginfo_t* si, void* uc)
 
 void port_crash_thread_init()
 {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 	// A separate stack allows the first diagnostic to survive stack exhaustion.
 	alignas(16) static thread_local unsigned char crash_stack[64 * 1024];
 	stack_t stack = {};
@@ -460,6 +460,9 @@ void port_install_crash_handlers()
 	// Native hardware exceptions keep their Windows status. Translating them
 	// through a CRT signal handler would replace it with a generic abort code.
 	signal(SIGABRT, crash_handler);
+#elif defined(__EMSCRIPTEN__)
+	// No signals in wasm: a trap or abort() ends the module, and the page
+	// reports it (Module.onAbort) with the browser's wasm stack trace.
 #else
 	// The first backtrace() loads the unwinder, which allocates: do it now.
 	void* warm[1];
@@ -549,6 +552,21 @@ static void map_mem1()
 			VirtualFree(p, 0, MEM_RELEASE);
 		exit(1);
 	}
+#elif defined(__EMSCRIPTEN__)
+	// wasm32 linear memory reaches 4 GiB (-sMAXIMUM_MEMORY=4GB), so MEM1 sits
+	// at 0x80000000 as in the native 32-bit build: move the heap break up to
+	// it and take MEM1 there. malloc carries on above MEM1; the range skipped
+	// below it is address space the browser does not back until touched.
+	void* p = (void*)-1;
+	uintptr_t brk = (uintptr_t)sbrk(0);
+	if (brk <= (uintptr_t)want && sbrk((intptr_t)((uintptr_t)want - brk)) != (void*)-1)
+		p = sbrk((intptr_t)port_mem1_size);
+	if (p != want) {
+		port_log("[port] cannot place MEM1 at 0x80000000 in wasm memory (break %p, got %p); "
+		         "the browser may have refused to grow memory past 2 GiB\n", (void*)brk, p);
+		exit(1);
+	}
+	memset(p, 0, port_mem1_size); // MEM1 is zeroed at boot on the console
 #else
 	void* p = map_exact(want, port_mem1_size);
 	if (p != want) {

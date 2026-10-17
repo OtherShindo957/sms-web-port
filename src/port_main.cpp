@@ -81,8 +81,14 @@ int main(int argc, char** argv)
 	return 0;
 }
 #else
+#ifdef __EMSCRIPTEN__
+extern "C" void port_web_boot(void); // web/runtime/web_boot.cpp
+#endif
 int main(int argc, char** argv)
 {
+#ifdef __EMSCRIPTEN__
+	port_web_boot();
+#endif
 	port_install_crash_handlers();
 	Args a = {argc, argv};
 	run_game(&a);

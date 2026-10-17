@@ -59,6 +59,11 @@ if(APPLE)
     target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
     target_link_libraries(sms_gx PUBLIC "-framework CoreFoundation")
 endif()
+# Emscripten's sysroot has GLES/WebGL headers only; the entry points are
+# loaded by name (gl_loader.cpp) as on every other host.
+if(EMSCRIPTEN)
+    target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+endif()
 target_compile_features(sms_gx PRIVATE cxx_std_17)
 # The SDK functions here that compute in floats round every operation as the
 # DOL's objects do, which MWCC built without contraction: no host compiler may

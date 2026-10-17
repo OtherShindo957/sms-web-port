@@ -43,6 +43,13 @@ static inline char** backtrace_symbols(void* const* frames, int count)
 	}
 	return out;
 }
+#elif defined(__EMSCRIPTEN__)
+#include <stdlib.h>
+// wasm has no stack the program can walk: no frames (the browser's own
+// console shows the JavaScript/wasm stack of a trap).
+static inline int backtrace(void**, int) { return 0; }
+static inline void backtrace_symbols_fd(void* const*, int, int) {}
+static inline char** backtrace_symbols(void* const*, int) { return NULL; }
 #else
 #include_next <execinfo.h>
 #endif
