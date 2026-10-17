@@ -26,7 +26,7 @@ self.onmessage = async (ev) => {
       let off = 0;
       while (off < buf.length) {
         const n = handle.write(buf.subarray(off), { at: done + off });
-        if (n <= 0) throw new Error('write failed (storage full?)');
+        if (n <= 0) throw new Error(`write failed at byte ${done + off} (browser storage full?)`);
         off += n;
       }
       done = end;
@@ -34,6 +34,7 @@ self.onmessage = async (ev) => {
     }
     handle.flush();
     const size = handle.getSize();
+    if (size !== file.size) throw new Error(`browser storage kept ${size} of ${file.size} bytes (storage quota?)`);
     handle.close();
     handle = null;
     if (size !== file.size) throw new Error(`stored ${size} bytes of ${file.size}`);

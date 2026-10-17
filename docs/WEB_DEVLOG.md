@@ -2,6 +2,18 @@
 
 Newest first. Each entry says what was tested and how; "compiles" never means "works".
 
+## 2026-10-17 (later) — the real game runs in the browser (no picture yet)
+
+Tested with the user's own GMSE01 Rev 0 `.ciso` (kept outside the repository; copied only into a throwaway test browser profile). Chrome 154 headless, SwiftShader.
+
+- Import: the 1.18 GB image copies into OPFS and validates. In Playwright's default incognito-style context OPFS kept only 993,954,402 of 1,180,729,920 bytes (in-memory, small quota); the page caught it and refused the image. The import worker now names that case, and `boot.mjs` uses a persistent profile, as a player's browser has.
+- `GXPeekZ` (the sun's lens-flare depth test) called a null GL entry point with no context: the EFB peek was the one GX entry point without the `s_ready` guard → it now returns an untouched EFB (far depth). Native builds always have a context, so this only changes the no-context path.
+- Display copies made without a context did not reach the frame hook, so the frame counter stood still → `executeCopy` reports the finished frame even with no context (presenting is a no-op then).
+- `web_boot.cpp` logs a heartbeat every 5 s: game frames and VI retraces.
+- **Real time** (`node web/tests/boot.mjs IMAGE --seconds 60`): 29.97 fps through the logos, then a steady 59.94 fps (+300 frames per 5 s) for the whole minute, retraces at 59.94 Hz, no traps.
+- **Scripted new game** (the native `plaza` regression's input: `--env SMS_WARP=1,0,1 --env SMS_AUTOPRESS=START@1400,... --env SMS_VI_DETERMINISTIC=1`): title → Start → file select → file A → new game → `SMS_WARP: stage 1 scenario 0 shines 1` → Delfino Plaza, which then runs (with the scripted walk) for 100+ s at ~215 unthrottled frames/s. Game logic, DVD streaming from OPFS, pad input, OSThreads and the card mount all work in wasm.
+- Not shown on screen: no GL context yet, so milestones 3-6 are reached in game logic only, not visually.
+
 ## 2026-10-17 — first browser build
 
 Environment: Linux Mint 22.3, Emscripten 6.0.12 (`~/dev/emsdk`), Chrome 154 (headless, SwiftShader WebGL), Node 26, Playwright 1.64.

@@ -73,8 +73,9 @@ Why not render on the game's worker through OffscreenCanvas: a worker's canvas o
 | --- | --- | --- |
 | 1 | WebAssembly module initialises | **done, tested** (`web/tests/smoke.mjs`, Chrome 154) |
 | 2 | Browser runtime starts (threads, OPFS disc access, WebGL 2 context) | **done, tested** (same test, 20/20 checks) |
-| 2b | Whole game compiles, links and boots into `SMS_main` | **done, tested up to the first disc file the synthetic image lacks** (`web/tests/boot.mjs`) |
-| 3 | Title screen renders | next: GX on WebGL 2 (§3) + a real GMSE01 image to test with |
+| 2b | Whole game compiles, links and boots into `SMS_main` | **done, tested** (`web/tests/boot.mjs`) |
+| 2c | Real disc: game runs at full speed; scripted new game reaches and runs Delfino Plaza (game logic, no picture) | **done, tested** with the user's GMSE01 image (WEB_DEVLOG.md) |
+| 3 | Title screen renders | next: GX on WebGL 2 (§3) |
 | 4 | Main menu accepts input | SDL2 keyboard/gamepad through Emscripten; focus/pointer-lock handling in the page |
 | 5 | Delfino Plaza loads | performance work: `-O3`, no DWARF in release, shader cache warm-up |
 | 6 | Mario moves and interacts | |
@@ -83,7 +84,7 @@ Why not render on the game's worker through OffscreenCanvas: a worker's canvas o
 
 ## 6. Known blockers and trade-offs
 
-- **No test disc on the build machine.** Everything past the first real archive read needs a genuine GMSE01 image; the automated tests use a synthetic image with the right structure and no game data (`web/tests/make_test_disc.py`). `node web/tests/boot.mjs /path/to/your.iso` runs the same boot test with a real image (copied only into the test browser's private storage).
+- **Test discs.** The automated tests use a synthetic image with the right structure and no game data (`web/tests/make_test_disc.py`). `node web/tests/boot.mjs /path/to/your.iso` runs the boot test with a real image (copied only into a throwaway browser profile). Incognito/private windows keep OPFS in memory with a small quota and cannot hold the 1.2-1.4 GB image; the page detects that and says so.
 - **Memory above 2 GiB.** MEM1 at 0x80000000 needs wasm memory to grow past 2 GiB (virtual). Chrome and Firefox allow 4 GiB for wasm32; this should be checked on Safari and on mobile, where the reservation may be refused. Fallback if needed: relocate MEM1 low and make `OSPhysicalToCached`/`OSCachedToPhysical` and the GX memory window (`GXPC_SetMemoryWindow`, which exists for this) use its base. That touches every low-memory access site, so it is the second choice.
 - **Hardware-register sink at 0xCC000000** is not mapped in the browser. The native comment says no game code writes there any more (the write-gather pipe goes through `GXVert.h` overrides); a stray write would trap with a stack trace, so it would be found, not silently corrupt memory.
 - **Cross-origin isolation** is mandatory for threads. A single-threaded build would need the OS layer rewritten on fibers + Asyncify; not planned.

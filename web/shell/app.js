@@ -229,7 +229,8 @@ async function play() {
     const game = new URLSearchParams(location.search).get('module') === 'game';
     await loadScript(game ? 'sms-game.js' : 'sms.js');
     await createSmsModule({
-      smsEnv: game ? { SMS_SKIP_MOVIES: '1' } : {},
+      // window.smsDebugEnv (tests) adds or overrides SMS_* options.
+      smsEnv: game ? Object.assign({ SMS_SKIP_MOVIES: '1' }, window.smsDebugEnv || {}) : {},
       canvas: ui.canvas,
       arguments: [DISC_PATH_IN_WASM],
       print: (t) => log(t),

@@ -2615,7 +2615,12 @@ static void copyEfb(uint32_t ctrl) {
 }
 
 void executeCopy(uint32_t ctrl) {
-    if (!s_ready) return;
+    if (!s_ready) {
+        // No GL context: nothing to copy, but the game has still finished a
+        // frame (the frame count and the hook's presenting, a no-op then).
+        if (((ctrl >> 14) & 1) && g_displayCopyHook) g_displayCopyHook(g.copyDest);
+        return;
+    }
     flushBatch();
     glcInvalidate();  // copies, clears and write-backs set GL state directly
     pixMetricPause();
@@ -2797,6 +2802,9 @@ static GLuint peekSource(bool depth) {
 
 // Returns the raw texel: RGBA bytes packed little-endian, or the 32-bit depth.
 static uint32_t peekRaw(int x, int y, bool depth) {
+    // No GL context (rendering disabled): an EFB that was never drawn, at
+    // the far plane, as the other entry points treat it.
+    if (!s_ready) return depth ? 0xFFFFFFFFu : 0u;
     if (s_efbW != EFB_W && x >= 0) x = int((float(x) + 0.5f) * s_wide);  // the game camera's coordinates: stretched
     flushBatch();
     glcInvalidate();

@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <unistd.h>
 
 namespace {
 
@@ -33,6 +35,24 @@ void set_default(const char* name, const char* value)
 {
 	if (!getenv(name))
 		setenv(name, value, 0);
+}
+
+extern "C" uint32_t GXPC_FrameCount(void);        // platform/gx: the game's display copies
+extern "C" unsigned long VIGetRetraceCount(void);  // platform/vi: emulated retraces
+
+// Every 5 s, how far the game has got: the page has no picture yet, so this
+// is how a hang is told from a game that is running. Only reads counters.
+void* heartbeat(void*)
+{
+	uint32_t last = 0;
+	for (int s = 5;; s += 5) {
+		sleep(5);
+		uint32_t frames = GXPC_FrameCount();
+		fprintf(stderr, "[web] %d s: %u game frames (+%u), %lu retraces\n", s, frames, frames - last,
+			VIGetRetraceCount());
+		last = frames;
+	}
+	return nullptr;
 }
 
 } // namespace
@@ -70,6 +90,9 @@ extern "C" void port_web_boot(void)
 	set_default("SMS_HEADLESS", "1");
 	set_default("SMS_AUDIO", "0");
 	set_default("SMS_GX_GL_THREAD", "0");
+	pthread_t th;
+	if (pthread_create(&th, nullptr, heartbeat, nullptr) == 0)
+		pthread_detach(th);
 	fprintf(stderr, "[web] boot: disc %s, saves %s\n", getenv("SMS_DISC_IMAGE") ? getenv("SMS_DISC_IMAGE") : "(none)",
 		getenv("SMS_SAVE_DIR") ? getenv("SMS_SAVE_DIR") : "(none)");
 }
