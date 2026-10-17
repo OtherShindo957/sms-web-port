@@ -17,6 +17,11 @@
 #include <string.h>
 #include <time.h>
 #include <vector>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/html5.h>
+#include <emscripten/threading.h>
+extern void* sms_web_get_proc(const char*);
+#endif
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <sys/stat.h>
 #include <unistd.h>
@@ -716,6 +721,28 @@ int GXPC_InitAuto(float efbScale) {
     // findDesktop for a session that lost DISPLAY / WAYLAND_DISPLAY).
     else headless = false;
     g_displayCopyHook = onDisplayCopy;
+#ifdef __EMSCRIPTEN__
+    if (!headless) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) return 0;
+        s_window = SDL_CreateWindow("Super Mario Sunshine", 0, 0, 640, 528, SDL_WINDOW_SHOWN);
+        EmscriptenWebGLContextAttributes attr;
+        emscripten_webgl_init_context_attributes(&attr);
+        attr.majorVersion = 2;
+        attr.alpha = false;
+        attr.antialias = false;
+        attr.explicitSwapControl = true;
+        attr.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_ALWAYS;
+        auto ctx = emscripten_webgl_create_context("#canvas", &attr);
+        if (ctx <= 0 || emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS
+            || !GXPC_Init(sms_web_get_proc, efbScale)) {
+            logmsg("WebGL 2 renderer could not start");
+            return 0;
+        }
+        s_mode = MODE_WINDOW;
+        logmsg("WebGL 2 renderer ready (main-thread proxy)");
+        return 1;
+    }
+#endif
 #ifdef SMS_GX_HAVE_SDL2
     if (!headless) {
         if (openWindowAnyBackend(efbScale)) {
@@ -777,7 +804,11 @@ void GXPC_Present(const void* xfb) {
             captureWindow(s_frame, w, h);
             t1 = nowSeconds();
             if (hdr) hdrFramePresent(s_vsync != 0);
+#ifdef __EMSCRIPTEN__
+            else emscripten_webgl_commit_frame();
+#else
             else SDL_GL_SwapWindow(s_window);
+#endif
             tSwapped = nowSeconds();
         });
         {  // the wait for the frame's queued work counts as GX's, the rest is presenting
@@ -837,6 +868,11 @@ static void noteInputDevice(const SDL_Event& ev) {
 void sms_gx_pump_events(void) {
 #ifdef SMS_GX_HAVE_SDL2
     if (s_mode != MODE_WINDOW) return;
+#ifdef __EMSCRIPTEN__
+    // SDL's HTML events are proxied to the worker that registered them.
+    // The game never returns to its JS event loop, so drain them per frame.
+    emscripten_current_thread_process_queued_calls();
+#endif
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (!menuVisible()) noteInputDevice(ev);

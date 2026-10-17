@@ -56,7 +56,7 @@
       <button id="remove" disabled>Remove stored disc</button>
       <button id="play" class="primary" disabled>Play</button>
     </div>
-    <p id="status" class="muted">Checking your browser…</p>
+    <p id="status" class="muted" role="status" aria-live="polite">Checking your browser…</p>
     <progress id="progress" max="1" value="0" hidden></progress>
     <p class="note">Supported: Super Mario Sunshine, North America (GMSE01), Rev 0, as .iso, .gcm or Dolphin .ciso.
       The image is checked and copied into this site's private browser storage (OPFS). Nothing is uploaded.</p>
@@ -67,7 +67,8 @@
     <ul class="caps" id="caps"></ul>
   </section>
 
-  <section id="stage"><canvas id="canvas" width="640" height="528" tabindex="0"></canvas></section>
+  <p class="note">Experimental. Sound starts with Play (add <code>?audio=0</code> to the address to turn it off). Controls: Enter — Start; WASD / arrows — move; Space — A (jump); Shift — B; E — R (spray FLUDD); V — X (change nozzle); Q — L; IJKL — camera.</p>
+  <section id="stage"><canvas aria-label="Game display. Click to focus keyboard controls." id="canvas" width="640" height="528" tabindex="0"></canvas></section>
 
   <section class="panel" style="margin-top:16px">
     <strong>Runtime log</strong>

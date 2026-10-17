@@ -285,7 +285,11 @@ bool shaderHasEarlyFragmentTests();
 bool earlyZWritesRejected();
 // `lines`: the program for a line batch, which draws each line as a quad
 // GXSetLineWidth wide (a geometry shader)
-const ShaderProgram* shaderForCurrentState(bool depthOnly = false, bool lines = false);
+// `pass`: the colour pass, the ordered depth pass (flushBatch's early-Z
+// fallback), or the count pass (WebGL pixel metrics: the colour pass's
+// discards, then a constant 1/255 for additive counting)
+enum { kPassColor = 0, kPassDepthOnly = 1, kPassCount = 2 };
+const ShaderProgram* shaderForCurrentState(int pass = kPassColor, bool lines = false);
 void shaderPrepareStage(int stage);  // while a stage loads: its programs (the warm-up)
 
 // ---------------------------------------------------------------- overlay panels

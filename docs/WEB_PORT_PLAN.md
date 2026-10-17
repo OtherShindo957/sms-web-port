@@ -17,9 +17,9 @@ Status, development log and next steps: [WEB_DEVLOG.md](WEB_DEVLOG.md). Building
 | Threads | Every `OSThread` is a host pthread; one emulated CPU, baton passed under a mutex (`platform/os/os_thread.cpp`) | Emscripten pthreads (SharedArrayBuffer workers). Requires a cross-origin isolated page (COOP/COEP headers). `main()` runs on a worker (`PROXY_TO_PTHREAD`) so the game may block like on desktop. **Verified**: the audio DSP thread starts and runs under the scheduler in Chrome. |
 | Disc | `platform/disc` reads `.iso/.gcm/.ciso` with `open`/`pread`; `platform/dvd` serves the FST from it | WasmFS + OPFS backend gives real POSIX `open`/`pread` on a worker. The page copies the image into OPFS once (persists across visits). **Verified** with the unchanged `gcdisc.cpp` and `dvd.cpp`. |
 | Saves | Memory card as files (`platform/card`, `SMS_SAVE_DIR`) | `SMS_SAVE_DIR=/opfs/sms/card-a`: persistent browser storage, same file format. Not yet exercised by a running game. |
-| Graphics | `platform/gx`: GX register model → OpenGL **3.3 core** + GLSL 330; optional GL thread with a command queue (`gx_glthread.*`); SDL2 window or EGL headless | See §3. Compiles for wasm; does not render yet. |
+| Graphics | `platform/gx`: GX register model → OpenGL **3.3 core** + GLSL 330; optional GL thread with a command queue (`gx_glthread.*`); SDL2 window or EGL headless | See §3. Renders through the browser WebGL 2 compatibility backend; see the development log. |
 | Input | `platform/pad`: SDL2 keyboard/game controllers, bindings, GameCube adapter via libusb | SDL2's Emscripten port maps keyboard and the Gamepad API; libusb adapter path is native-only. |
-| Audio | DSP HLE + software mixer (`platform/audio`), output through SDL2 audio | Mixer is portable C++. Output must become Web Audio (an AudioWorklet fed from a shared ring buffer) — SDL2's Emscripten audio uses the deprecated ScriptProcessor on the main thread. |
+| Audio | DSP HLE + software mixer (`platform/audio`), output through SDL2 audio | Mixer is portable C++. **Done**: the AI output writes a ring of stereo frames in shared wasm memory; `web/shell/audio-worklet.js` plays it at 32 kHz (Atomics, no locks), and a pacing thread does what the SDL callback did (kick the CPU when low, queue more after a dry spell, keep the DAC clock while the context is suspended). SDL2's Emscripten audio (ScriptProcessor on the main thread) is not used. |
 | Crash reporting | signals, `sigaltstack`, register dumps, fork+addr2line | Not available in wasm; gated out. A trap aborts the module and the browser reports the wasm stack with function names (seen in the boot test). |
 | Other OS APIs | `execinfo`, `dlfcn`, `/proc`, Discord presence, libusb | `execinfo.h` shim returns no frames on Emscripten; the rest compile against Emscripten's libc and degrade at run time (presence/adapter simply not found). |
 
@@ -36,6 +36,12 @@ Compiler/flag incompatibilities found: `-m32/-m64` (dropped), `-fno-pie`/`-no-pi
 - Browser-only code lives in `web/` and in `__EMSCRIPTEN__` branches of platform files; the decomp is touched only by `decomp-patches/web-01-data-export-sized-aliases.patch` (Clang rejects an alias declared as an array of unknown size).
 
 ## 3. Rendering: WebGL 2, not WebGPU
+
+Implementation update (2026-10-17): `platform/gx/src/gx_web.cpp` adapts desktop entry points and GLSL for WebGL 2. An explicitly presented context is proxied by Emscripten to the browser main thread (`OFFSCREEN_FRAMEBUFFER`); the native GL-thread queue remains disabled. Vertex/uniform data uses CPU uploads, indices use a separate element buffer with CPU rebasing, and depth peeks encode depth into RGBA before reading it. Unused sampler array entries are unbound to avoid WebGL framebuffer feedback validation errors. Native builds retain their existing paths.
+
+Update (later the same day): exact pixel metrics (the goop counters) without sample-count queries, through a count pass into a target sharing the EFB depth and a GPU column sum; element draws queued instead of proxied synchronously; copy write-backs, peeks and pixel metrics read a frame later through pixel-pack buffers as on the desktop (with depth snapshots encoded as colour); `glGetBufferSubData` run on the main thread (Emscripten does not proxy it). Delfino Plaza runs at its 60 fps on an Intel iGPU (WEB_DEVLOG.md).
+
+The table below records the original design; wide lines/points, non-COPY logic operations and sampler LOD bias remain open.
 
 **Decision: WebGL 2** for the first playable build.
 
@@ -75,11 +81,11 @@ Why not render on the game's worker through OffscreenCanvas: a worker's canvas o
 | 2 | Browser runtime starts (threads, OPFS disc access, WebGL 2 context) | **done, tested** (same test, 20/20 checks) |
 | 2b | Whole game compiles, links and boots into `SMS_main` | **done, tested** (`web/tests/boot.mjs`) |
 | 2c | Real disc: game runs at full speed; scripted new game reaches and runs Delfino Plaza (game logic, no picture) | **done, tested** with the user's GMSE01 image (WEB_DEVLOG.md) |
-| 3 | Title screen renders | next: GX on WebGL 2 (§3) |
-| 4 | Main menu accepts input | SDL2 keyboard/gamepad through Emscripten; focus/pointer-lock handling in the page |
-| 5 | Delfino Plaza loads | performance work: `-O3`, no DWARF in release, shader cache warm-up |
-| 6 | Mario moves and interacts | |
-| 7 | Audio and saves | AudioWorklet output from the DSP HLE mixer; memory card in OPFS (path already set) |
+| 3 | Title screen renders | **done, visually verified** in Chrome/SwiftShader |
+| 4 | Main menu accepts input | **done, visually verified**: browser keyboard through SDL2; title, memory card file creation, file select |
+| 5 | Delfino Plaza loads | **done, visually verified**: new game → Delfino Airstrip; Delfino Plaza (`SMS_WARP=1,0,1`) at 52-60 fps on an Intel iGPU |
+| 6 | Mario moves and interacts | **done, visually verified**: run, jump, swim, goop damage, camera, FLUDD spray and hover |
+| 7 | Audio and saves | **audio done** (AudioWorklet, measured signal); memory card in OPFS creates its file (persisting a saved game not yet checked) |
 | 8 | Other levels, full game | movies (THP decoder is portable), save states (need a wasm replacement for the link-map ranges) |
 
 ## 6. Known blockers and trade-offs

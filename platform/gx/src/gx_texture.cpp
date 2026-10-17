@@ -528,7 +528,9 @@ static GLuint samplerFor(uint32_t mode0, uint32_t mode1, uint32_t levels, int hi
     float bias = float(int8_t((mode0 >> 9) & 0xFF)) / 32.0f;
     if (effectMips) bias += log2f(efbScale());
     glSamplerParameteri(smp, GL_TEXTURE_MIN_FILTER, minf);
+#ifndef __EMSCRIPTEN__
     glSamplerParameterf(smp, GL_TEXTURE_LOD_BIAS, bias);
+#endif
     glSamplerParameterf(smp, GL_TEXTURE_MIN_LOD, minLod);
     glSamplerParameterf(smp, GL_TEXTURE_MAX_LOD, maxLod);
     if (minf != GL_NEAREST && minf != GL_NEAREST_MIPMAP_NEAREST && !effectMips && anisotropy() > 1.0f)

@@ -339,7 +339,7 @@ static std::string genFS(const ShaderKey& k) {
     if (k.earlyZ) {
         s.insert(s.find('\n') + 1, "#extension GL_ARB_shader_image_load_store : require\nlayout(early_fragment_tests) in;\n");
     }
-    if (k.depthOnly) return s + "void main() { o_color = vec4(0.0); }\n";
+    if (k.depthOnly == kPassDepthOnly) return s + "void main() { o_color = vec4(0.0); }\n";
     char buf[2048];
     s += "void main() {\n"
          "  ivec4 cprev = u_tevreg[0], creg0 = u_tevreg[1], creg1 = u_tevreg[2], creg2 = u_tevreg[3];\n"
@@ -542,7 +542,7 @@ static std::string genFS(const ShaderKey& k) {
         }
         s += "  color.rgb = mix(color.rgb, u_fogcolor.rgb, f);\n";
     }
-    s += "  o_color = color;\n}\n";
+    s += k.depthOnly == kPassCount ? "  o_color = vec4(1.0 / 255.0);\n}\n" : "  o_color = color;\n}\n";
     return s;
 }
 
@@ -1109,15 +1109,17 @@ static const ShaderProgram* lineProgram(const ProgramKey& key) {
     return &(s_linePrograms[key] = sp);
 }
 
-const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines) {
+const ShaderProgram* shaderForCurrentState(int pass, bool lines) {
     if (s_cacheState < 0) shaderSetup();
     ProgramKey key;
     ShaderKey& k = key.k;
     buildKey(k);
-    k.depthOnly = depthOnly;
+    k.depthOnly = uint32_t(pass);
     key.indScale[0] = k.numInd ? g.bp[BP_RAS1_SS0] : 0;
     key.indScale[1] = k.numInd ? g.bp[BP_RAS1_SS0 + 1] : 0;
+#ifndef __EMSCRIPTEN__
     if (lines) return lineProgram(key);
+#endif
     // consecutive batches mostly share a program
     if (s_lastProgram && key == s_lastKey) return s_lastProgram;
     recordKey(key);

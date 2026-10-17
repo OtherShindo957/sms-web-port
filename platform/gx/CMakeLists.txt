@@ -62,6 +62,7 @@ endif()
 # Emscripten's sysroot has GLES/WebGL headers only; the entry points are
 # loaded by name (gl_loader.cpp) as on every other host.
 if(EMSCRIPTEN)
+    target_sources(sms_gx PRIVATE src/gx_web.cpp)
     target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 endif()
 target_compile_features(sms_gx PRIVATE cxx_std_17)

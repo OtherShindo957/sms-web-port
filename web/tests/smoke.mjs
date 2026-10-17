@@ -58,7 +58,7 @@ try {
   const pageLog = [];
   page.on('console', (m) => pageLog.push(`[console.${m.type()}] ${m.text()}`));
   page.on('pageerror', (e) => pageLog.push(`[pageerror] ${e.message}`));
-  await page.goto(`http://127.0.0.1:${port}/`);
+  await page.goto(`http://127.0.0.1:${port}/?module=runtime`);
 
   await page.waitForFunction(() => !/Checking your browser/.test(document.getElementById('status').textContent));
   const caps = await page.$$eval('#caps li', (lis) => lis.map((l) => [l.className, l.textContent]));

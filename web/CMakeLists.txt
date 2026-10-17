@@ -9,7 +9,7 @@
 #                    Built by default.
 #   sms_game         The decompiled game as a wasm static library (built by
 #                    `cmake --build ... --target sms_game`, or SMS_WEB_GAME=ON);
-#                    not linked into a browser executable yet.
+#                    linked into sms_web_game below.
 
 option(SMS_WEB_GAME "Build the game library in the default (all) target" OFF)
 if(NOT SMS_WEB_GAME)
@@ -74,6 +74,7 @@ target_link_libraries(sms_web_game PRIVATE
   -Wl,--whole-archive sms_game sms_gx -Wl,--no-whole-archive SDL2::SDL2)
 target_link_options(sms_web_game PRIVATE ${SMS_WEB_LINK_FLAGS}
   -sGL_ENABLE_GET_PROC_ADDRESS=1 -sFULL_ES3=1 -sOFFSCREENCANVAS_SUPPORT=0
+  -sOFFSCREEN_FRAMEBUFFER=1
   # Every OSThread is a pthread; workers are started ahead of time so that a
   # thread created while the page's main thread is busy does not wait for it.
   -sPTHREAD_POOL_SIZE=16

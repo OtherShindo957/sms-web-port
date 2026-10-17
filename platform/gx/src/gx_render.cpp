@@ -195,7 +195,12 @@ struct StreamBuffer {
     size_t segOf(size_t p) const { return p * kSegments / size; }
     // Every draw reading what was written so far has been issued: fence the
     // segments from `unfenced` through `last`.
+    // WebGL orders glBufferSubData after the draws queued before it, and a
+    // fence there costs two waits for the main thread: none are made.
     void fenceThrough(size_t last) {
+#ifdef __EMSCRIPTEN__
+        return;
+#endif
         for (size_t sg = unfenced; sg <= last && sg < kSegments; sg++)
             if (!fence[sg]) fence[sg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     }
@@ -254,6 +259,19 @@ struct StreamBuffer {
             });
             return;
         }
+#ifdef __EMSCRIPTEN__
+        if (n == 1) {
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(first), GLsizeiptr(pc[0].bytes), pc[0].data);
+            return;
+        }
+        {  // one upload (each is a copy queued for the main thread)
+            static std::vector<uint8_t> block;
+            block.resize(end - first);
+            for (int i = 0; i < n; i++) memcpy(block.data() + (pc[i].at - first), pc[i].data, pc[i].bytes);
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(first), GLsizeiptr(block.size()), block.data());
+        }
+        return;
+#endif
         uint8_t* dst = static_cast<uint8_t*>(
             glMapBufferRange(GL_ARRAY_BUFFER, GLintptr(first), GLsizeiptr(end - first),
                              GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT | GL_MAP_INVALIDATE_RANGE_BIT));
@@ -264,6 +282,9 @@ struct StreamBuffer {
     }
 };
 static StreamBuffer s_stream;
+#ifdef __EMSCRIPTEN__
+static GLuint s_webIndices;
+#endif
 static const size_t kArenaBytes = size_t(64) << 20;  // the display-list arena after the ring
 static GLint s_uboAlign = 256;
 
@@ -277,7 +298,11 @@ static GLuint makeVao(uint32_t fmt, GLuint buf) {
     const VtxFmtLayout& l = vtxFmtLayout(fmt);
     glGenVertexArrays(1, &vao);
     glcBindVertexArray(vao);
+#ifdef __EMSCRIPTEN__
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_webIndices);
+#else
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buf);
+#endif
     glcBindArrayBuffer(buf);
     const GLsizei st = l.stride;
     auto off = [](size_t o) { return reinterpret_cast<const void*>(o); };
@@ -1162,7 +1187,12 @@ void rendererInit(float efbScale) {
     glcInvalidate();
     glGenVertexArrays(1, &s_vao);
     glcBindVertexArray(s_vao);
+#ifdef __EMSCRIPTEN__
+    s_stream.init(8u << 20, 0);
+    glGenBuffers(1, &s_webIndices);
+#else
     s_stream.init(128u << 20, kArenaBytes);
+#endif
     // Values of the attributes a packed format leaves out (see vaoForFormat):
     // the same defaults the loader used to write into every vertex.
     glVertexAttrib4f(1, 0.0f, 0.0f, 1.0f, 1.0f);  // normal
@@ -1302,6 +1332,9 @@ static size_t s_arenaPos = 0;  // from the arena's start
 static uint32_t s_arenaGen = 1;
 
 bool arenaEnabled() {
+#ifdef __EMSCRIPTEN__
+    return false;
+#endif
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("SMS_GX_DL_ARENA");
@@ -1751,12 +1784,32 @@ static uint32_t s_frameNo = 0;   // display copies so far
 uint32_t g_displayFrames = 0;    // the same, for the rest of sms_gx
 static uint32_t s_drawGen = 0;   // bumped by anything that changes the EFB
 static bool asyncReads() {
+#ifdef __EMSCRIPTEN__
+    return false; // WebGL depth reads use the colour-encoding path below.
+#endif
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("SMS_GX_SYNC_READS");
         on = !(e && e[0] == '1');
     }
     return on != 0;
+}
+// Copy write-backs (and on WebGL peeks and pixel metrics too) read through
+// pixel-pack buffers and land a frame later, as asyncReads gives them on the
+// desktop. asyncReads itself stays off on WebGL, where the desktop's depth
+// readbacks do not exist; there these reads make no fences: creating one
+// waits for the main thread, and the buffers are read a frame later.
+static bool asyncWriteBacks() {
+#ifdef __EMSCRIPTEN__
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("SMS_GX_SYNC_READS");
+        on = !(e && e[0] == '1');
+    }
+    return on != 0;
+#else
+    return asyncReads();
+#endif
 }
 
 // Pixel metrics (GXClearPixMetric/GXReadPixMetric). Delfino's pollution
@@ -1817,9 +1870,233 @@ static uint64_t queryResult(GLuint q) {
     return n;
 }
 
+#ifdef __EMSCRIPTEN__
+// WebGL 2 has no sample-count queries (only "any samples passed"), and the
+// pollution counters need the count: while a metric is cleared and not yet
+// read, each batch is also drawn into s_countTex, which shares the EFB's
+// depth, with the count pass's program (the batch's own discards, then
+// 1/255 blended additively: an exact count per pixel up to 255). A read sums
+// the columns on the GPU into one row of integers, so only that row comes
+// back. The game reads each count right after its draws (a draw-sync
+// callback) and clears before the next, so counting stops at a read.
+static GLuint s_countTex, s_countFbo, s_countDepth, s_sumTex, s_sumFbo, s_sumProg;
+static GLint s_sumUHeight = -1;
+static int s_countW, s_countH;
+static bool s_countOk = false;  // the count framebuffer is complete (checked when attached)
+static bool s_counting = false;
+static uint64_t s_countLast = 0;  // a second read before the next clear gets the same count
+
+static const char* kSumVs = R"(#version 330 core
+void main() {
+    gl_Position = vec4(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0, 0.0, 1.0);
+}
+)";
+static const char* kSumFs = R"(#version 330 core
+uniform sampler2D u_count;
+uniform int u_height;
+out uvec4 o_color;
+void main() {
+    int x = int(gl_FragCoord.x);
+    uint n = 0u;
+    for (int y = 0; y < u_height; y++) n += uint(texelFetch(u_count, ivec2(x, y), 0).r * 255.0 + 0.5);
+    o_color = uvec4(n, 0u, 0u, 0u);
+}
+)";
+
+static bool webCountTarget() {
+    if (s_msaa) return false;  // the depth to share is a multisampled renderbuffer
+    int W = scaled(s_efbW), H = scaled(EFB_H);
+    if (!s_countFbo) {
+        glGenTextures(1, &s_countTex);
+        glGenTextures(1, &s_sumTex);
+        glGenFramebuffers(1, &s_countFbo);
+        glGenFramebuffers(1, &s_sumFbo);
+        s_sumProg = compileProgram(kSumVs, kSumFs);
+        glUseProgram(s_sumProg);
+        glUniform1i(glGetUniformLocation(s_sumProg, "u_count"), 0);
+        s_sumUHeight = glGetUniformLocation(s_sumProg, "u_height");
+    }
+    if (s_countW != W || s_countH != H) {
+        s_countW = W;
+        s_countH = H;
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_countTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, s_sumTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, W, 1, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_countFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_countTex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_sumFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_sumTex, 0);
+        s_countDepth = 0;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, s_countFbo);
+    if (s_countDepth != s_efbDepth) {  // the EFB's depth texture is remade with the EFB
+        s_countDepth = s_efbDepth;
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, s_efbDepth, 0);
+        // checked only here: the check waits for the main thread
+        s_countOk = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (!s_countOk) logmsg("pixel metrics: the count framebuffer is incomplete; pollution reads 0");
+    }
+    return s_countOk;
+}
+
+static void webCountClear() {
+    s_countLast = 0;
+    glcInvalidate();
+    s_counting = webCountTarget();
+    if (s_counting) {
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+    glcInvalidate();
+}
+
+// Around the count pass of a batch whose colour-pass state is applied: only
+// what the pass changes, restored to what the cache holds.
+static void webCountBegin(float texW[8], float texH[8]) {
+    const ShaderProgram* cp = shaderForCurrentState(kPassCount, s_bclass == PRIM_LINES);
+    glcUseProgram(cp->prog);
+    uploadUniforms(cp, texW, texH);
+    glBindFramebuffer(GL_FRAMEBUFFER, s_countFbo);
+    glDepthMask(GL_FALSE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if (g_glc.blend != 1) glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ONE, GL_ONE);
+}
+static void webCountEnd(const ShaderProgram* sp) {
+    GlCache& c = g_glc;
+    glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+    glDepthMask(c.depthMask);
+    glColorMask(c.cmask[0], c.cmask[1], c.cmask[2], c.cmask[3]);
+    if (c.blend == 1) {
+        glBlendEquationSeparate(c.beq[0], c.beq[1]);
+        glBlendFuncSeparate(c.bf[0], c.bf[1], c.bf[2], c.bf[3]);
+    } else {
+        glDisable(GL_BLEND);
+        c.beq[0] = c.beq[1] = GL_FUNC_ADD;
+        c.bf[0] = c.bf[1] = c.bf[2] = c.bf[3] = GL_ONE;
+    }
+    glcUseProgram(sp->prog);
+}
+
+// Each read's column sums also go into a pixel-pack buffer of its slot (the
+// clear/read pairs of a frame, as for the desktop's queries), and a read
+// whose slot drew the same triangles the frame before takes that frame's
+// sums, which the GPU has long finished: the desktop's asynchronous queries
+// do the same. Otherwise (or with SMS_GX_SYNC_READS=1) it waits for this one.
+static GLuint s_sumPbo[2][kMetricSlots];
+static int s_sumPboW[2][kMetricSlots];
+static bool s_sumFetched[2][kMetricSlots];  // its sum is in s_sumValue (webFetchFrameReads)
+static uint64_t s_sumValue[2][kMetricSlots];
+
+static uint64_t webSumRow(const uint32_t* row, int w) {
+    uint64_t n = 0;
+    for (int x = 0; x < w; x++) n += row[size_t(x) * 4];
+    return n;
+}
+
+static uint64_t webCountRead() {
+    if (!s_counting) return s_countLast;
+    s_counting = false;
+    glcInvalidate();
+    glBindFramebuffer(GL_FRAMEBUFFER, s_sumFbo);
+    glViewport(0, 0, s_countW, 1);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(s_sumProg);
+    glUniform1i(s_sumUHeight, s_countH);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_countTex);
+    glBindSampler(0, 0);
+    glBindVertexArray(s_copyVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    // RGBA_INTEGER/UNSIGNED_INT is the read every WebGL 2 R32UI target allows
+    const GLsizeiptr rowBytes = GLsizeiptr(s_countW) * 16;
+    static std::vector<uint32_t> row;
+    row.resize(size_t(s_countW) * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    bool have = false;
+    const int cur = s_frameNo & 1, prev = cur ^ 1, slot = s_mqSlot;
+    if (asyncWriteBacks() && slot >= 0 && slot < kMetricSlots) {
+        GLuint& pbo = s_sumPbo[cur][slot];
+        if (!pbo) glGenBuffers(1, &pbo);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+        glBufferData(GL_PIXEL_PACK_BUFFER, rowBytes, nullptr, GL_STREAM_READ);
+        glReadPixels(0, 0, s_countW, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
+        s_sumPboW[cur][slot] = s_countW;
+        s_sumFetched[cur][slot] = false;
+        if (s_mqUsed[prev][slot] && s_mqFrame[prev][slot] + 1 == s_frameNo && s_mqTris[prev][slot] == s_pixTris &&
+            s_sumPboW[prev][slot] == s_countW) {
+            if (s_sumFetched[prev][slot]) {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+                glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+                glcInvalidate();
+                s_mqUsed[cur][slot] = true;
+                s_mqTris[cur][slot] = s_pixTris;
+                s_mqFrame[cur][slot] = s_frameNo;
+                return s_countLast = s_sumValue[prev][slot];
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, s_sumPbo[prev][slot]);
+            if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, rowBytes, GL_MAP_READ_BIT)) {
+                memcpy(row.data(), px, size_t(rowBytes));
+                have = true;
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        s_mqUsed[cur][slot] = true;
+        s_mqTris[cur][slot] = s_pixTris;
+        s_mqFrame[cur][slot] = s_frameNo;
+    }
+    if (!have) {
+        s_syncReads++;
+        glReadPixels(0, 0, s_countW, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT, row.data());
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+    glcInvalidate();
+    return s_countLast = webSumRow(row.data(), s_countW);
+}
+#endif
+
+// SMS_GX_LOG_PIXMETRIC=1: log reads (the first 64, then every 600th), to
+// compare the pollution counts of two builds
+static uint32_t logMetric(uint32_t v) {
+    static int on = -1;
+    if (on < 0) on = getenv("SMS_GX_LOG_PIXMETRIC") != nullptr;
+    if (on) {
+        static uint32_t n = 0;
+        if (n < 64 || n % 600 == 0) logmsg("pixel metric read %u (frame %u): %u", n, s_frameNo, v);
+        n++;
+    }
+    return v;
+}
+
 void pixMetricClear() {
     flushBatch();
     if (!s_ready) return;
+#ifdef __EMSCRIPTEN__
+    webCountClear();
+    if (s_mqSlotFrame != s_frameNo) {
+        s_mqSlotFrame = s_frameNo;
+        s_mqSlot = -1;
+    }
+    s_mqSlot++;
+    s_pixTris = 0;
+    s_pixActive = true;
+    return;
+#endif
     if (s_pixActive) {
         glEndQuery(GL_SAMPLES_PASSED);
         if (s_pixCurPooled) s_queryPool.push_back(s_pixCur);
@@ -1850,6 +2127,12 @@ void pixMetricClear() {
 uint32_t pixMetricRead() {
     flushBatch();
     if (!s_ready || !s_pixActive) return 0;
+#ifdef __EMSCRIPTEN__
+    {
+        uint64_t v = uint64_t(double(webCountRead()) / (double(s_scale) * double(s_scale))) + uint64_t(s_pixTris) * 4;
+        return logMetric(v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v));
+    }
+#endif
     glEndQuery(GL_SAMPLES_PASSED);
     uint64_t samples = 0;
     int cur = s_frameNo & 1, slot = s_mqSlot;
@@ -1879,7 +2162,7 @@ uint32_t pixMetricRead() {
     s_pixCurPooled = true;
     glBeginQuery(GL_SAMPLES_PASSED, s_pixCur);
     uint64_t v = uint64_t(double(samples) / (double(s_scale) * double(s_scale))) + uint64_t(s_pixTris) * 4;
-    return v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v);
+    return logMetric(v > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(v));
 }
 
 static void prefetchMetrics() {
@@ -1902,6 +2185,9 @@ static void prefetchMetrics() {
 }
 
 static void pixMetricPause() {
+#ifdef __EMSCRIPTEN__
+    return;  // the count pass is only made for colour passes (flushBatch)
+#endif
     if (s_pixActive) {
         glEndQuery(GL_SAMPLES_PASSED);
         s_pixPending.emplace_back(s_pixCur, s_pixCurPooled);
@@ -1909,6 +2195,9 @@ static void pixMetricPause() {
     }
 }
 static void pixMetricResume() {
+#ifdef __EMSCRIPTEN__
+    return;
+#endif
     if (s_pixActive) {
         s_pixCur = poolQuery();
         s_pixCurPooled = true;
@@ -2029,7 +2318,7 @@ void flushBatch() {
     GxTimer timer;
     GxTimer tf(&g_flushSeconds);
     s_xmap = drawXMap();
-    const ShaderProgram* sp = shaderForCurrentState(false, s_bclass == PRIM_LINES);
+    const ShaderProgram* sp = shaderForCurrentState(kPassColor, s_bclass == PRIM_LINES);
     glcUseProgram(sp->prog);
     applyGlState();
 
@@ -2044,7 +2333,15 @@ void flushBatch() {
     }
     for (uint32_t i = 0; i < nind && i < 4; i++) used |= 1u << ((g.bp[BP_RAS1_IREF] >> (6 * i)) & 7);
     for (int m = 0; m < 8; m++) {
-        if (!(used & (1u << m))) continue;
+        if (!(used & (1u << m))) {
+#ifdef __EMSCRIPTEN__
+            // WebGL validates every sampler array element, including unused
+            // maps that a preceding EFB copy left bound to its attachments.
+            glcBindTexture(m, 0);
+            glcBindSampler(m, 0);
+#endif
+            continue;
+        }
         GxTimer tt(&s_texSeconds);
         bindTextureMap(m, &texW[m], &texH[m]);
     }
@@ -2087,7 +2384,9 @@ void flushBatch() {
     const bool streamed = s_bidx.size != 0;
     if (streamed) {
         pc[np++] = {s_bdata.data, s_bdata.size, s_bstride, 0};
+#ifndef __EMSCRIPTEN__  // WebGL draws the indices from their own buffer (below)
         pc[np++] = {s_bidx.data, s_bidx.size * 4, 4, 0};
+#endif
     }
     if (np) s_stream.appendAll(pc, np);
     if (xfWritten) s_xfOffset = pc[0].at;
@@ -2095,7 +2394,11 @@ void flushBatch() {
         glBindBufferRange(GL_UNIFORM_BUFFER, 0, s_stream.buf, GLintptr(s_xfOffset), sizeof(xfBlock));
         g_glc.uniformBuffer = s_stream.buf;  // the range bind also sets the generic binding
     }
+#ifdef __EMSCRIPTEN__
+    const size_t vOff = streamed ? pc[np - 1].at : 0, iOff = 0;
+#else
     const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
+#endif
     const GLint streamBase = GLint(vOff / s_bstride);
     GLenum mode = s_bclass == PRIM_TRIS ? GL_TRIANGLES : s_bclass == PRIM_LINES ? GL_LINES : GL_POINTS;
     bool earlyFallback = !shaderHasEarlyFragmentTests() && earlyZWritesRejected();
@@ -2116,8 +2419,29 @@ void flushBatch() {
             else ranges.push_back(Range{vaoForFormat(s_bfmt), iOff + size_t(sg.first) * 4, GLsizei(sg.count), streamBase});
         }
     }
+#ifdef __EMSCRIPTEN__
+    // WebGL forbids sharing element storage with vertex/uniform buffers.
+    // Rebase the CPU indices, replacing desktop base-vertex draws.
+    static std::vector<uint32_t> webIndices;
+    webIndices.resize(s_bidx.size);
+    for (size_t i = 0; i < s_bidx.size; i++) webIndices[i] = s_bidx.data[i] + streamBase;
+    glcBindVertexArray(vaoForFormat(s_bfmt));
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_webIndices);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, webIndices.size() * 4, webIndices.data(), GL_STREAM_DRAW);
+    for (auto& range : ranges) { range.iOff -= iOff; range.base = 0; }
+    // A counted batch first goes into the count target, while the depth
+    // buffer still holds what the colour pass will test against.
+    if (s_counting) {
+        webCountBegin(texW, texH);
+        for (const Range& r : ranges) {
+            glcBindVertexArray(r.vao);
+            glDrawElements(mode, r.count, GL_UNSIGNED_INT, reinterpret_cast<const void*>(r.iOff));
+        }
+        webCountEnd(sp);
+    }
+#endif
     if (earlyFallback) {
-        const ShaderProgram* depthSp = shaderForCurrentState(true, s_bclass == PRIM_LINES);
+        const ShaderProgram* depthSp = shaderForCurrentState(kPassDepthOnly, s_bclass == PRIM_LINES);
         glcUseProgram(depthSp->prog);
         uploadUniforms(depthSp, texW, texH);
         GLboolean masks[4];
@@ -2385,7 +2709,7 @@ static void resolveWriteBack(PendingWriteBack& w) {
         const void* px;
         {
             GxTimer tw(&s_waitSeconds);
-            glClientWaitSync(w.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            if (w.fence) glClientWaitSync(w.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
             glBindBuffer(GL_PIXEL_PACK_BUFFER, w.pbo);
             px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(w.readBytes), GL_MAP_READ_BIT);
         }
@@ -2393,7 +2717,7 @@ static void resolveWriteBack(PendingWriteBack& w) {
         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     }
-    glDeleteSync(w.fence);
+    if (w.fence) glDeleteSync(w.fence);
     s_freePbos.push_back(w.pbo);
 }
 
@@ -2417,12 +2741,12 @@ static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, 
     efbCopySetBytes(dest, bytes);
     const int rows = encodeCopy(tex, ow, oh, tw, th, layout, bytes);
     const uint32_t readBytes = uint32_t(rows) * 1024;
-    if (!asyncReads() || copyVerify()) {
+    if (!asyncWriteBacks() || copyVerify()) {
         static std::vector<uint8_t> px;
         px.resize(readBytes);
         glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
         if (copyVerify()) verifyEncode(tex, ow, oh, tw, th, layout, px.data(), bytes);
-        if (!asyncReads()) {
+        if (!asyncWriteBacks()) {
             s_syncReads++;
             storeEncoded(px.data(), dest, bytes);
             return;
@@ -2453,8 +2777,12 @@ static void writeBackCopy(const void* dest, GLuint tex, int ow, int oh, int tw, 
     glBufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(readBytes), nullptr, GL_STREAM_READ);
     glReadPixels(0, 0, 256, rows, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0),
-                       readBytes, s_frameNo, false, nullptr};
+#ifdef __EMSCRIPTEN__
+    const GLsync fence = nullptr;
+#else
+    const GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+#endif
+    PendingWriteBack w{dest, bytes, hashBytes(dest, bytes), pbo, fence, readBytes, s_frameNo, false, nullptr};
     s_writeBacks.push_back(w);
 }
 
@@ -2614,6 +2942,11 @@ static void copyEfb(uint32_t ctrl) {
     }
 }
 
+#ifdef __EMSCRIPTEN__
+static void webFetchFrameReads();
+static bool asyncPeeks();
+#endif
+
 void executeCopy(uint32_t ctrl) {
     if (!s_ready) {
         // No GL context: nothing to copy, but the game has still finished a
@@ -2630,6 +2963,9 @@ void executeCopy(uint32_t ctrl) {
     copyEfb(ctrl);
     // presenting (the hook) is timed apart from sms_gx: GXPC_GetTimes
     if (disp && g_displayCopyHook) g_displayCopyHook(dest);
+#ifdef __EMSCRIPTEN__
+    if (disp && asyncPeeks()) webFetchFrameReads();
+#endif
     if (disp && glt::active()) {  // the frame is shown: the GL thread reads its results (see gx_glthread.h)
         prefetchWriteBacks();
         prefetchPeeks();
@@ -2762,9 +3098,49 @@ static uint32_t peekSync(int x, int y, bool depth) {
     glBindFramebuffer(GL_FRAMEBUFFER, efbReadFbo(scaled(x), scaled(y), scaled(x) + 1, scaled(y) + 1,
                                                  depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT));
     if (depth) {
+#ifdef __EMSCRIPTEN__
+        // WebGL cannot read depth pixels directly. Encode the sampled 24-bit
+        // depth in RGB using the same shader as the game's Z24X8 copies.
+        static GLuint depthPixel = 0, depthFbo = 0;
+        if (!depthPixel) {
+            glGenTextures(1, &depthPixel);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, depthPixel);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glGenFramebuffers(1, &depthFbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, depthFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, depthPixel, 0);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, depthFbo);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glViewport(0, 0, 1, 1);
+        glUseProgram(s_copyProg);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_efbColor);
+        glBindSampler(0, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, s_efbDepth);
+        glBindSampler(1, 0);
+        float rect[4] = {(float(scaled(x)) + 0.5f) / scaled(s_efbW),
+                         (float(scaled(y)) + 0.5f) / scaled(EFB_H), 0, 0};
+        glUniform4fv(s_copyURect, 1, rect);
+        glUniform1i(s_copyUMode, 32 | 6);
+        glBindVertexArray(s_copyVao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+        return uint32_t(px[0]) << 24 | uint32_t(px[1]) << 16 | uint32_t(px[2]) << 8;
+#else
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
         glReadPixels(scaled(x), scaled(y), 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &v);
         return v;
+#endif
     }
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(scaled(x), scaled(y), 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
@@ -2800,6 +3176,61 @@ static GLuint peekSource(bool depth) {
     return s_peekFbo;
 }
 
+#ifdef __EMSCRIPTEN__
+// WebGL reads no depth pixels: a depth snapshot is the depth encoded as
+// Z24X8 colour (as peekSync encodes its one pixel), drawn at 1x.
+static GLuint s_peekZFbo, s_peekZTex;
+static int s_peekZW;
+static GLuint webPeekDepthSource() {
+    efbReadFbo(0, 0, INT32_MAX, INT32_MAX, GL_DEPTH_BUFFER_BIT);  // s_efbDepth holds the EFB's depth
+    if (!s_peekZFbo || s_peekZW != s_efbW) {
+        if (!s_peekZFbo) {
+            glGenTextures(1, &s_peekZTex);
+            glGenFramebuffers(1, &s_peekZFbo);
+        }
+        s_peekZW = s_efbW;
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_peekZTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s_efbW, EFB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, s_peekZFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_peekZTex, 0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, s_peekZFbo);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, s_efbW, EFB_H);
+    glUseProgram(s_copyProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_efbColor);
+    glBindSampler(0, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, s_efbDepth);
+    glBindSampler(1, 0);
+    const float whole[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    glUniform4fv(s_copyURect, 1, whole);
+    glUniform1i(s_copyUMode, 32 | 6);
+    glBindVertexArray(s_copyVao);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    return s_peekZFbo;
+}
+#endif
+
+// Peeks read a snapshot of the frame before (below) where asyncReads, and on
+// WebGL too unless SMS_GX_SYNC_READS=1 (asyncReads stays off there: it also
+// picks the desktop's depth readback paths).
+static bool asyncPeeks() {
+#ifdef __EMSCRIPTEN__
+    return asyncWriteBacks();
+#else
+    return asyncReads();
+#endif
+}
+
 // Returns the raw texel: RGBA bytes packed little-endian, or the 32-bit depth.
 static uint32_t peekRaw(int x, int y, bool depth) {
     // No GL context (rendering disabled): an EFB that was never drawn, at
@@ -2809,7 +3240,7 @@ static uint32_t peekRaw(int x, int y, bool depth) {
     flushBatch();
     glcInvalidate();
     GxTimer tp(&s_peekSeconds);
-    if (!asyncReads() || x < 0 || y < 0 || x >= s_efbW || y >= EFB_H) return peekSync(x, y, depth);
+    if (!asyncPeeks() || x < 0 || y < 0 || x >= s_efbW || y >= EFB_H) return peekSync(x, y, depth);
     if (s_peekDrawGen != s_drawGen || s_peekFrame != s_frameNo) {
         if (s_peekFrame != s_frameNo) s_peekGroup = -1;
         s_peekGroup++;
@@ -2832,13 +3263,19 @@ static uint32_t peekRaw(int x, int y, bool depth) {
         }
         if (now.fence) glDeleteSync(now.fence);
         glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, peekSource(depth));
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+#ifdef __EMSCRIPTEN__  // no fence (see asyncWriteBacks); depth as colour
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, depth ? webPeekDepthSource() : peekSource(false));
+        glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        now.fence = 0;
+#else
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, peekSource(depth));
         if (depth) glReadPixels(0, 0, s_efbW, EFB_H, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
         else glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+#endif
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
-        now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         now.frame = s_frameNo;
     }
     PeekSnap& prev = s_peek[cur ^ 1][s_peekGroup][t];
@@ -2846,7 +3283,7 @@ static uint32_t peekRaw(int x, int y, bool depth) {
         takeFetchedPeek(prev);
         if (!prev.map) {
             GxTimer tw(&s_waitSeconds);
-            glClientWaitSync(prev.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+            if (prev.fence) glClientWaitSync(prev.fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
             glBindBuffer(GL_PIXEL_PACK_BUFFER, prev.pbo);
             prev.map = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
             glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
@@ -2854,21 +3291,73 @@ static uint32_t peekRaw(int x, int y, bool depth) {
         if (prev.map) {
             uint32_t v;
             memcpy(&v, prev.map + (size_t(y) * s_efbW + x) * 4, 4);
+#ifdef __EMSCRIPTEN__
+            if (depth) {  // Z24X8 bytes: high, middle, low
+                const uint8_t* px = prev.map + (size_t(y) * s_efbW + x) * 4;
+                v = uint32_t(px[0]) << 24 | uint32_t(px[1]) << 16 | uint32_t(px[2]) << 8;
+            }
+#endif
             return v;
         }
     }
     return peekSync(x, y, depth);
 }
 
+#ifdef __EMSCRIPTEN__
+// Presenting a frame waits for the main thread to run everything queued, so
+// right after it reading that frame's peek snapshots and metric sums waits
+// for nothing else, and the next frame's peeks and metrics (which take the
+// frame before's) find them on the CPU: the GL thread's prefetch, in effect.
+static void webFetchFrameReads() {
+    const uint32_t frame = s_frameNo - 1;
+    const int par = int(frame & 1);
+    const GLsizeiptr bytes = GLsizeiptr(s_efbW) * EFB_H * 4;
+    for (int gi = 0; gi < kPeekGroups; gi++)
+        for (int t = 0; t < 2; t++) {
+            PeekSnap& p = s_peek[par][gi][t];
+            if (!p.pbo || p.frame != frame || p.map) continue;
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, p.pbo);
+            p.map = static_cast<const uint8_t*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT));
+        }
+    static std::vector<uint32_t> row;
+    for (int slot = 0; slot < kMetricSlots; slot++) {
+        if (!s_mqUsed[par][slot] || s_mqFrame[par][slot] != frame || s_sumFetched[par][slot]) continue;
+        const int w = s_sumPboW[par][slot];
+        const GLsizeiptr rowBytes = GLsizeiptr(w) * 16;
+        row.resize(size_t(w) * 4);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, s_sumPbo[par][slot]);
+        if (const void* px = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, rowBytes, GL_MAP_READ_BIT)) {
+            memcpy(row.data(), px, size_t(rowBytes));
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            s_sumValue[par][slot] = webSumRow(row.data(), w);
+            s_sumFetched[par][slot] = true;
+        }
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+}
+#endif
+
 uint32_t peekColor(int x, int y) {
     uint32_t p = peekRaw(x, y, false);
     uint32_t c = (p >> 24) << 24 | (p & 0xFF) << 16 | ((p >> 8) & 0xFF) << 8 | ((p >> 16) & 0xFF);
     if (FILE* f = traceFile()) fprintf(f, "  GXPeekARGB(%d,%d) = %08X\n", x, y, c);
+    static int logPeeks = -1;  // SMS_GX_LOG_PEEKS=n: log the first n colour peeks
+    if (logPeeks < 0) logPeeks = getenv("SMS_GX_LOG_PEEKS") ? atoi(getenv("SMS_GX_LOG_PEEKS")) : 0;
+    if (logPeeks > 0) {
+        logmsg("peek ARGB (%d,%d) frame %u: %08X", x, y, s_frameNo, c);
+        logPeeks--;
+    }
     return c;
 }
 uint32_t peekZ(int x, int y) {
     uint32_t v = peekRaw(x, y, true);
     if (FILE* f = traceFile()) fprintf(f, "  GXPeekZ(%d,%d) = %06X\n", x, y, v >> 8);
+    static int logPeeks = -1;  // SMS_GX_LOG_PEEKS=n: log the first n depth peeks
+    if (logPeeks < 0) logPeeks = getenv("SMS_GX_LOG_PEEKS") ? atoi(getenv("SMS_GX_LOG_PEEKS")) : 0;
+    if (logPeeks > 0) {
+        logmsg("peek Z (%d,%d) frame %u: %06X", x, y, s_frameNo, v >> 8);
+        logPeeks--;
+    }
     return v >> 8;
 }
 }  // namespace gx

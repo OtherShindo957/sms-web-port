@@ -19,6 +19,8 @@
 // stops allocated (only the sequencer frees it), and the eight root sequence
 // slots run out after eight music changes (README.md, Environment).
 // SMS_NO_AUDIO (an empty sound configuration) leaves the DMA engine idle.
+// In the browser (Emscripten) the output is the page's AudioWorklet instead
+// of SDL: see "Browser output" below.
 // Pairs are (bus 2, bus 1) = (right, left) in DMA order; they are swapped for
 // SDL (SMS_AUDIO_SWAP=0 keeps DMA order).
 #include "port_compat.h"
@@ -35,6 +37,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <vector>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <unistd.h>
+#endif
 
 extern "C" int port_audio_dsp_frame_pending(void) __attribute__((weak));
 extern "C" int GXPC_GetSpeed(void) __attribute__((weak));
@@ -85,6 +91,7 @@ struct Ai {
 	std::vector<int16_t> fifo;
 	size_t head, count;
 	bool sdl;
+	bool web; // the browser's AudioWorklet plays the web ring (below)
 	bool fed; // a block has reached the FIFO
 	s16 lastL, lastR;
 	// Blocks queued beyond kBaseBlocks, added when the output ran dry and
@@ -271,6 +278,106 @@ bool open_sdl()
 	return true;
 }
 
+#ifdef __EMSCRIPTEN__
+// Browser output. The game runs on a worker; the page plays through an
+// AudioWorklet (web/shell/audio-worklet.js) on the browser's audio thread,
+// which can run no wasm and take no lock. So the output FIFO is a ring of
+// stereo frames in the module's shared memory with two frame counters: the
+// worklet reads the samples and advances `read` with Atomics, dma_block
+// advances `write`. The AudioContext runs at 32 kHz, the DAC rate. What the
+// SDL callback does besides playing (kick the CPU when the queue runs low,
+// queue more after it ran dry) is done by web_pace on a thread of its own.
+const u32 kWebFrames = 16384; // ring capacity, 0.5 s
+alignas(16) int16_t g_webRing[kWebFrames * 2];
+alignas(16) std::atomic<uint32_t> g_webCtl[4]; // write, read, dry frames, playback speed
+enum { kWebWrite, kWebRead, kWebDry, kWebSpeed };
+
+u32 web_level()
+{
+	return g_webCtl[kWebWrite].load() - g_webCtl[kWebRead].load();
+}
+
+void* web_pace(void*)
+{
+	u32 dryFrames = 0, steady = 0, lastDry = g_webCtl[kWebDry].load();
+	u32 lastRead = g_webCtl[kWebRead].load();
+	struct timespec moved;
+	clock_gettime(CLOCK_MONOTONIC, &moved);
+	for (;;) {
+		usleep(3000);
+		int speed = playback_speed();
+		// A suspended AudioContext (no user gesture yet, a background tab)
+		// reads nothing: past 250 ms without a read, play the ring into the
+		// void at the DAC rate, so the audio thread keeps its clock (as with
+		// SMS_AUDIO=0) until the worklet reads again.
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		uint32_t read = g_webCtl[kWebRead].load();
+		double idle = (double)(now.tv_sec - moved.tv_sec) + (now.tv_nsec - moved.tv_nsec) * 1e-9;
+		if (read != lastRead) {
+			lastRead = read;
+			moved    = now;
+		} else if (idle > 0.25) {
+			uint32_t step = std::min(web_level(), (u32)(kRate * 3 / 1000) * (u32)speed);
+			g_webCtl[kWebRead].compare_exchange_strong(read, read + step);
+			lastRead = read + step;
+		}
+		g_webCtl[kWebSpeed].store((u32)speed);
+		u32 dryNow = g_webCtl[kWebDry].load(), dry = dryNow - lastDry;
+		lastDry    = dryNow;
+		if (dry && g.fed && g.running) { // as sdl_callback: cover the next spell like this one
+			dryFrames += dry;
+			steady = 0;
+		} else if (dryFrames) {
+			int cover = (int)((dryFrames + kBlockFrames - 1) / kBlockFrames);
+			int need  = std::min(kMaxExtra, std::max(g.extra.load() + 1, cover));
+			if (need > g.extra.load()) {
+				g.extra.store(need);
+				g.grew.store(kBaseBlocks + need);
+			}
+			dryFrames = 0;
+		} else if (g.extra.load() > 0 && (steady += kRate * 3 / 1000) >= kRate * 30) {
+			g.extra.fetch_sub(1);
+			steady = 0;
+		}
+		if (g.running && web_level() < fifo_target(speed))
+			port_irq_kick();
+	}
+	return NULL;
+}
+
+// Hands the ring to the page (Module.smsAudioStart), which connects the
+// worklet; false when the page has no audio (then the host clock paces).
+bool open_web()
+{
+	int ok = MAIN_THREAD_EM_ASM_INT({
+		if (typeof Module.smsAudioStart != 'function') return 0;
+		return Module.smsAudioStart({memory: HEAPU8.buffer, ring: $0, frames: $1, ctl: $2, rate: $3}) ? 1 : 0;
+	}, g_webRing, kWebFrames, g_webCtl, kRate);
+	if (!ok)
+		return false;
+	pthread_t th;
+	pthread_create(&th, NULL, web_pace, NULL);
+	pthread_detach(th);
+	port_log("[audio] browser output: AudioWorklet at %u Hz\n", (unsigned)kRate);
+	return true;
+}
+
+// Queues a block's frames (output order) for the worklet; frames that do not
+// fit are dropped, as the SDL FIFO drops them.
+void web_queue(const int16_t* lr, size_t frames)
+{
+	u32 w = g_webCtl[kWebWrite].load(), r = g_webCtl[kWebRead].load();
+	g.fed = true;
+	for (size_t i = 0; i < frames && w - r < kWebFrames; i++, w++) {
+		size_t p          = (w % kWebFrames) * 2;
+		g_webRing[p]     = (int16_t)((lr[i * 2] * g.volume) >> 8);
+		g_webRing[p + 1] = (int16_t)((lr[i * 2 + 1] * g.volume) >> 8);
+	}
+	g_webCtl[kWebWrite].store(w);
+}
+#endif
+
 void init_output()
 {
 	const char* e = getenv("SMS_AUDIO");
@@ -306,6 +413,11 @@ void init_output()
 		port_log("[audio] deterministic VI clock: AI DMA paced by retraces, no output device\n");
 		return;
 	}
+#ifdef __EMSCRIPTEN__
+	g.web = g.output && !headless && open_web();
+	if (g.web)
+		return;
+#endif
 	g.sdl          = g.output && wantSdl && open_sdl();
 	if (!g.sdl) {
 		if (g.output)
@@ -338,6 +450,10 @@ void dma_block()
 				fflush(g.wav);
 			}
 		}
+#ifdef __EMSCRIPTEN__
+		if (g.web)
+			web_queue(g.mix.data(), frames);
+#endif
 		if (g.sdl) {
 			std::lock_guard<std::mutex> lk(g.mu);
 			g.fed      = true;
@@ -381,19 +497,21 @@ void ai_poll()
 	}
 	if (dac_thread_busy())
 		return; // polled again when it blocks (the scheduler delivers interrupts then)
-	if (g.sdl) {
+	if (g.sdl || g.web) {
 		if (int blocks = g.grew.exchange(0))
 			port_log("[audio] the output ran dry; queueing %u ms from now on\n", blocks * kBlockFrames * 1000 / kRate);
-		size_t level;
 		size_t target = fifo_target(playback_speed());
-		{
+		auto level    = []() -> size_t {
+#ifdef __EMSCRIPTEN__
+			if (g.web)
+				return web_level();
+#endif
 			std::lock_guard<std::mutex> lk(g.mu);
-			level = g.count;
-		}
-		if (level < target) {
+			return g.count;
+		};
+		if (level() < target) {
 			dma_block(); // one block per delivery: the audio thread must run
-			std::lock_guard<std::mutex> lk(g.mu);
-			if (g.count < target)
+			if (level() < target)
 				port_irq_kick();
 		}
 	} else if (g.due.load() > 0) {

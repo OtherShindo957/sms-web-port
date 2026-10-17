@@ -32,7 +32,7 @@ git submodule update --init decomp
 bdir=build/web
 jobs=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 targets=("$@")
-(( ${#targets[@]} )) || targets=(sms_web_runtime)
+(( ${#targets[@]} )) || targets=(sms_web_game sms_web_runtime)
 
 emcmake cmake -S . -B "$bdir" -DCMAKE_BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
 make_flags=()
