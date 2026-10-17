@@ -165,8 +165,8 @@ void save(int no)
 {
 	CardFile& f   = g_files[no];
 	std::string b = card_dir() + "/" + disk_name(f);
-	write_file(b + ".dat", f.data.data(), f.data.size());
-	write_file(b + ".stat", &f.stat, sizeof f.stat);
+	if (write_file(b + ".dat", f.data.data(), f.data.size()) && write_file(b + ".stat", &f.stat, sizeof f.stat))
+		port_log("[card] saved %s (%u bytes)\n", disk_name(f).c_str(), (unsigned)f.data.size());
 }
 
 void migrate_eclipse_settings();

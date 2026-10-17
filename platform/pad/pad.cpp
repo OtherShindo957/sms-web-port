@@ -18,6 +18,8 @@
 #include <ctype.h>
 #include <dlfcn.h>
 #include <algorithm>
+#include <stdio.h>
+#include <string>
 #include <vector>
 
 // --- SDL2 event ABI (SDL_events.h, SDL_scancode.h, SDL_gamecontroller.h) ---
@@ -578,15 +580,11 @@ std::vector<AutoPress> g_auto;
 typedef int (*PushEventFn)(void* ev);
 PushEventFn g_push;
 
-void autopress_init()
+// Adds the presses in `text` (control@field[+hold], separated by commas or
+// white space); `from` names the source in messages.
+void autopress_parse(char* text, const char* from)
 {
-	const char* e = getenv("SMS_AUTOPRESS");
-	if (!e || !*e)
-		return;
-	char buf[1024];
-	strncpy(buf, e, sizeof buf - 1);
-	buf[sizeof buf - 1] = 0;
-	for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+	for (char* tok = strtok(text, ", \t\r\n"); tok; tok = strtok(NULL, ", \t\r\n")) {
 		char* at = strchr(tok, '@');
 		if (!at)
 			continue;
@@ -600,12 +598,56 @@ void autopress_init()
 			if (strcasecmp(kControlNames[i], tok) == 0)
 				c = i;
 		if (c < 0 || g_nbind[c] == 0) {
-			port_log("[pad] SMS_AUTOPRESS: unknown or unbound control '%s'\n", tok);
+			port_log("[pad] %s: unknown or unbound control '%s'\n", from, tok);
 			continue;
 		}
 		AutoPress a = { c, (u32)atoi(at + 1), 0, false, false };
 		a.until     = a.at + hold;
 		g_auto.push_back(a);
+	}
+}
+
+// SMS_AUTOPRESS_FILE=path: presses from a file, read again whenever it has
+// grown, so a tool can add presses while the game runs: it stops the game,
+// appends presses for fields still to come, and lets it go on. The run is
+// then the one SMS_AUTOPRESS with the whole file gives.
+std::string g_autoFile;
+long g_autoFileRead; // bytes parsed: up to the last separator seen
+
+void autopress_follow()
+{
+	FILE* f = fopen(g_autoFile.c_str(), "rb");
+	if (!f)
+		return;
+	std::string add;
+	if (fseek(f, g_autoFileRead, SEEK_SET) == 0) {
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+			add.append(buf, n);
+	}
+	fclose(f);
+	const size_t end = add.find_last_of(", \t\r\n");
+	if (end == std::string::npos)
+		return; // nothing complete yet
+	add.resize(end + 1);
+	g_autoFileRead += (long)add.size();
+	autopress_parse(&add[0], "SMS_AUTOPRESS_FILE");
+}
+
+void autopress_init()
+{
+	const char* e    = getenv("SMS_AUTOPRESS");
+	const char* file = getenv("SMS_AUTOPRESS_FILE");
+	if ((!e || !*e) && (!file || !*file))
+		return;
+	if (e && *e) { // as long as it is (a scripted playthrough runs to thousands of presses)
+		std::vector<char> text(e, e + strlen(e) + 1);
+		autopress_parse(text.data(), "SMS_AUTOPRESS");
+	}
+	if (file && *file) {
+		g_autoFile = file;
+		autopress_follow();
 	}
 	// Headless runs have no SDL event loop: set the key state directly.
 	if (!(GXPC_IsHeadless && GXPC_IsHeadless()))
@@ -643,6 +685,8 @@ void send_binding(int bind, bool down)
 
 extern "C" void port_pad_autopress_field(u32 field)
 {
+	if (!g_autoFile.empty())
+		autopress_follow();
 	for (size_t i = 0; i < g_auto.size(); i++) {
 		AutoPress& a = g_auto[i];
 		if (a.done)

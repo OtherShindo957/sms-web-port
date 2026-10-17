@@ -258,6 +258,7 @@ The everyday options are in the [README](../README.md#options); this is the full
 | `SMS_SHOTS=f,f,...`, `SMS_SHOT_DIR` | capture the XFB at these fields (retail numbering) as PPM; `tools/shots.py` converts them into `build/shots/` and compares with retail |
 | `SMS_WINDOW_SHOTS=n,n,...` | capture the window as shown, with the port's menus over the game, at these GX frames (`GXPC_FrameCount`) as `SMS_SHOT_DIR/window<n>.ppm` (needs a window, not `SMS_HEADLESS`) |
 | `SMS_AUTOPRESS=control@field[+hold],...` | scripted input (e.g. `start@1400+20,stick_left@3300+40,a@3500+30`); in a window it is injected as SDL key events, i.e. through the keyboard path |
+| `SMS_AUTOPRESS_FILE=path` | more scripted input, in the same form (commas or white space between presses), read again whenever the file grows: a tool can stop the game (SIGSTOP), read its state, append presses for fields still to come and let it go on, and the file then replays that run as `SMS_AUTOPRESS` (`web/tests/airstrip.input` was made this way) |
 | `SMS_FIELD_CLOCK=retrace` | shots/autopress count VI retraces (wall clock) instead of game fields (2 per display copy, the default) |
 | `SMS_VI_DETERMINISTIC=1` | virtual VI/OS clock: retraces fire when the game idles (or spins on `OSGetTick` for a whole field), `OSGetTime` follows them from a fixed date, AI DMA is paced by retraces (no output device); two runs with the same input give identical frames |
 | `SMS_VI_HZ=<rate>` | retrace rate override (benchmarking) |
