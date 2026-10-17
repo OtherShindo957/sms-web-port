@@ -1,6 +1,6 @@
 # Developer guide
 
-How the port is put together and where changes go. To build and play, see the [README](../README.md) and [BUILD.md](../BUILD.md).
+How the port is put together and where changes go. To build and play, see the [README](../README.md) (browser), [NATIVE-PORT.md](NATIVE-PORT.md) and [BUILD.md](../BUILD.md) (desktop).
 
 ## Where a fix goes
 
@@ -239,7 +239,7 @@ Audited 2026-09-30 from the DOL's disassembly (the decomp's `build/GMSE01/asm`),
 
 ## Environment variables
 
-The everyday options are in the [README](../README.md#options); this is the full list.
+The everyday options are in [NATIVE-PORT.md](NATIVE-PORT.md#options); this is the full list.
 
 | Variable | Effect |
 | --- | --- |

@@ -3,7 +3,7 @@
 A save state is the game at one moment, saved to a file and loaded back in place: in a level, `SAVE_STATE`
 (F5, or L1 + R1 on a controller) saves one; in the pause menu, which shows those buttons at its top right
 with LOAD SAVE STATE, the same buttons open the list of states, and `LOAD_STATE` (F6) loads the newest. The
-player's side is in the [README](../README.md#save-states).
+player's side is in the [native port README](NATIVE-PORT.md#save-states).
 
 ## Two ways to load
 
