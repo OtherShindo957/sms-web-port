@@ -1,7 +1,8 @@
 // Super Mario Sunshine Web: the page around the wasm runtime.
 // - checks the browser has what the runtime needs,
 // - validates a disc image locally (header only) and copies it into OPFS,
-// - starts the runtime (sms.js / sms.wasm) once a valid image is stored.
+// - starts the runtime (sms.js / sms.wasm) once a valid image is stored, and
+//   shows the game alone, fullscreen, while it is played.
 // The disc image is only ever read with File.slice in this browser.
 'use strict';
 
@@ -11,11 +12,12 @@ const FULL_DISC = 1459978240;
 const params = new URLSearchParams(location.search);
 const game = params.get('module') !== 'runtime';
 const audioWanted = params.get('audio') !== '0';
+const moviesWanted = params.get('movies') !== '0'; // the game's cutscenes (THP); A skips each
 
 const $ = (id) => document.getElementById(id);
 const ui = {
   status: $('status'), progress: $('progress'), caps: $('caps'), log: $('log'),
-  disc: $('disc'), play: $('play'), remove: $('remove'), canvas: $('canvas'),
+  disc: $('disc'), play: $('play'), remove: $('remove'), canvas: $('canvas'), stage: $('stage'),
 };
 
 let capsOk = false;
@@ -23,6 +25,7 @@ let stored = null;     // metadata of the stored, validated image
 let running = false;
 let importing = false; // an import or removal is running in this page
 let audio = null;      // { ctx, ready }: the game's output (audio-worklet.js)
+let mod = null;        // the game's Module, once started
 
 function setStatus(text, cls = 'muted') {
   ui.status.textContent = text;
@@ -39,7 +42,9 @@ function log(line) {
 }
 
 function refreshButtons() {
-  ui.play.disabled = !(capsOk && stored && !running && !importing);
+  // while the game runs, Play goes back to it
+  ui.play.textContent = running && game ? 'Back to the game' : 'Play';
+  ui.play.disabled = running ? !game || viewing() : !(capsOk && stored && !importing);
   ui.remove.disabled = !stored || running || importing;
   ui.disc.disabled = running || importing;
 }
@@ -320,6 +325,96 @@ function startGameAudio(ring) {
   return true;
 }
 
+// -------------------------------------------------------------- the game view
+//
+// Playing shows the game alone: #stage, which holds only the canvas, covers the
+// page (body.playing hides the rest) and is made fullscreen. Browsers allow
+// fullscreen only from a user gesture, so it is asked for in the Play click
+// itself, before anything is awaited. Leaving fullscreen (Escape) returns to
+// the page with the game still running; Play goes back. Where fullscreen is
+// refused (an iframe without allowfullscreen, a browser setting) the stage
+// still fills the window, and Escape returns from that too.
+//
+// The canvas's size in device pixels goes to the game (smsSetDisplaySize,
+// platform/gx/src/gx_platform.cpp), which draws at that size and letterboxes
+// its 4:3 picture into it: black bars only where the screen's shape differs.
+
+const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+const viewing = () => document.body.classList.contains('playing');
+
+function enterGameView() {
+  document.body.classList.add('playing');
+  refreshButtons();
+  ui.canvas.focus();
+  noteActivity();
+  const el = ui.stage;
+  const request = el.requestFullscreen || el.webkitRequestFullscreen;
+  const refused = (why) => log(`[page] fullscreen not available (${why}); the game fills the window, Escape returns to the page`);
+  if (fullscreenElement() === el) return;
+  if (!request || document.fullscreenEnabled === false || document.webkitFullscreenEnabled === false) {
+    refused('not allowed here');
+    return;
+  }
+  try {
+    const p = request.call(el, { navigationUI: 'hide' });
+    if (p && p.then) p.then(() => ui.canvas.focus(), (e) => refused(e.message || e.name));
+  } catch (e) {
+    refused(e.message);
+  }
+}
+
+function leaveGameView() {
+  if (!viewing()) return;
+  document.body.classList.remove('playing', 'idle');
+  if (fullscreenElement()) {
+    const r = (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    if (r && r.catch) r.catch(() => {});
+  }
+  refreshButtons();
+}
+
+// fullscreen left with Escape (or the browser's own control): back to the page
+function onFullscreenChange() {
+  if (!fullscreenElement() && viewing()) leaveGameView();
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+// in the window (fullscreen refused), or where the browser passes Escape on
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && viewing()) leaveGameView();
+}, true);
+
+// the pointer hides over the game after two seconds without moving
+let idleTimer = 0;
+function noteActivity() {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { if (viewing()) document.body.classList.add('idle'); }, 2000);
+}
+ui.stage.addEventListener('pointermove', noteActivity);
+
+let displaySize = null; // [w, h] in device pixels
+function sendDisplaySize() {
+  if (displaySize && mod && mod.smsSetDisplaySize) mod.smsSetDisplaySize(displaySize[0], displaySize[1]);
+}
+if (typeof ResizeObserver === 'function') {
+  const ro = new ResizeObserver((entries) => {
+    const e = entries[entries.length - 1];
+    const dp = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+    const dpr = window.devicePixelRatio || 1;
+    const w = dp ? dp.inlineSize : Math.round(e.contentRect.width * dpr);
+    const h = dp ? dp.blockSize : Math.round(e.contentRect.height * dpr);
+    if (w < 16 || h < 16) return; // hidden
+    displaySize = [Math.min(w, 4096), Math.min(h, 4096)];
+    sendDisplaySize();
+  });
+  try {
+    ro.observe(ui.canvas, { box: 'device-pixel-content-box' });
+  } catch (e) {
+    ro.observe(ui.canvas);
+  }
+}
+
 // --------------------------------------------------------------------- runtime
 
 function loadScript(src) {
@@ -333,17 +428,24 @@ function loadScript(src) {
 }
 
 async function play() {
+  if (running) { // back to the game
+    enterGameView();
+    if (audio && audio.ctx.state !== 'running') audio.ctx.resume();
+    return;
+  }
   running = true;
   audio = createAudio();  // before any await: needs the click
+  if (game) enterGameView(); // so does fullscreen
   refreshButtons();
   setStatus('Starting the runtime…');
   try {
     // The game is the default; ?module=runtime runs the small diagnostic build.
     await loadScript(game ? 'sms-game.js' : 'sms.js');
     const disc = discPathInWasm(stored);
-    await createSmsModule({
+    mod = {
       // window.smsDebugEnv (tests) adds or overrides SMS_* options.
-      smsEnv: game ? Object.assign({ SMS_SKIP_MOVIES: '1', SMS_DISC_IMAGE: disc }, audioWanted ? {} : { SMS_AUDIO: '0' },
+      smsEnv: game ? Object.assign({ SMS_DISC_IMAGE: disc }, audioWanted ? {} : { SMS_AUDIO: '0' },
+        moviesWanted ? {} : { SMS_SKIP_MOVIES: '1' },
         window.smsDebugEnv || {}) : {},
       smsAudioStart: startGameAudio,
       canvas: ui.canvas,
@@ -355,11 +457,14 @@ async function play() {
           'Reload without ?module=runtime to play the game.'
           : `Runtime check failed (code ${rc}); see the log.`, rc === 0 ? 'ok' : 'bad');
       },
-      onAbort: (what) => { setStatus(`The runtime stopped: ${what}`, 'bad'); },
-    });
+      onAbort: (what) => { leaveGameView(); setStatus(`The runtime stopped: ${what}`, 'bad'); },
+      smsDisplayReady: () => sendDisplaySize(),
+    };
+    await createSmsModule(mod);
   } catch (e) {
-    setStatus(`Cannot start: ${e.message}`, 'bad');
     running = false;
+    leaveGameView();
+    setStatus(`Cannot start: ${e.message}`, 'bad');
     refreshButtons();
   }
 }
@@ -369,7 +474,9 @@ async function play() {
 // A trap or a failed call on this thread stops the game without a word in the
 // status line otherwise (the workers wait on it forever).
 window.addEventListener('error', (e) => {
-  if (running) setStatus(`The game stopped: ${e.message}`, 'bad');
+  if (!running) return;
+  leaveGameView(); // so the message is seen
+  setStatus(`The game stopped: ${e.message}`, 'bad');
 });
 
 ui.disc.addEventListener('change', () => {

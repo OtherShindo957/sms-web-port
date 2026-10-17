@@ -18,6 +18,8 @@
 #include <time.h>
 #include <vector>
 #ifdef __EMSCRIPTEN__
+#include <atomic>
+#include <emscripten.h>
 #include <emscripten/html5.h>
 #include <emscripten/threading.h>
 extern void* sms_web_get_proc(const char*);
@@ -72,6 +74,15 @@ double s_lastPresent = 0;  // the last display copy's present, 0 when skipped
 int s_vsync = 0;
 uint32_t s_frame = 0;
 
+#ifdef __EMSCRIPTEN__
+// The page sizes the picture: it stores the canvas's size in device pixels
+// here (w << 16 | h, through Module.smsSetDisplaySize), and each present
+// resizes the drawing buffer to it first, so the game letterboxes into the
+// whole canvas (all of the screen in fullscreen) at the display's resolution.
+// 0 until the page has measured it: SDL's 640x528 window.
+std::atomic<uint32_t> s_webDisplay{0};
+uint32_t s_webCanvas = 0;  // the drawing buffer's size, as set from here
+#endif
 #ifdef SMS_GX_HAVE_SDL2
 SDL_Window* s_window = nullptr;
 SDL_GLContext s_glctx = nullptr;
@@ -738,6 +749,12 @@ int GXPC_InitAuto(float efbScale) {
             logmsg("WebGL 2 renderer could not start");
             return 0;
         }
+        MAIN_THREAD_EM_ASM({
+            Module.smsSetDisplaySize = function(w, h) {
+                Atomics.store(new Uint32Array(wasmMemory.buffer, $0, 1), 0, ((w << 16) | h) >>> 0);
+            };
+            if (Module.smsDisplayReady) Module.smsDisplayReady();
+        }, &s_webDisplay);
         s_mode = MODE_WINDOW;
         logmsg("WebGL 2 renderer ready (main-thread proxy)");
         return 1;
@@ -783,6 +800,15 @@ void GXPC_Present(const void* xfb) {
     if (s_mode == MODE_WINDOW && s_window) {
         int w = 0, h = 0;
         SDL_GL_GetDrawableSize(s_window, &w, &h);
+#ifdef __EMSCRIPTEN__
+        if (const uint32_t want = s_webDisplay.load(std::memory_order_relaxed)) {
+            // queued behind the frame's GL calls, like them; only on a change
+            if (want != s_webCanvas) emscripten_set_canvas_element_size("#canvas", int(want >> 16), int(want & 0xFFFF));
+            s_webCanvas = want;
+            w = int(want >> 16);
+            h = int(want & 0xFFFF);
+        }
+#endif
         double t0 = 0, t1 = 0, tSwapped = 0;
         const bool hdr = hdrActive();
         // on the GL thread, after what the frame queued before (the frame's

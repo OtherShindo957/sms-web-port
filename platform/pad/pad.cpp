@@ -383,12 +383,14 @@ void on_event(const union SDL_Event* ev)
 		const sdl::KeyboardEvent* k = (const sdl::KeyboardEvent*)ev;
 		if (k->scancode >= 0 && k->scancode < 512)
 			g_key[k->scancode] = type == sdl::KEYDOWN;
+#ifndef __EMSCRIPTEN__ // in the browser Escape leaves fullscreen and closing the tab quits
 		if (type == sdl::KEYDOWN)
 			for (int i = 0; i < g_nbind[C_QUIT]; i++)
 				if (g_bind[C_QUIT][i] == k->scancode) {
 					port_log("[pad] quit key pressed\n");
 					exit(0);
 				}
+#endif
 		break;
 	}
 	case sdl::MOUSEMOTION: {
