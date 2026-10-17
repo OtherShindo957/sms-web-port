@@ -16,7 +16,7 @@ Status, development log and next steps: [WEB_DEVLOG.md](WEB_DEVLOG.md). Building
 | Operator new | Game `operator new/delete` (JKRHeap) renamed with `objcopy --redefine-syms` so libc++ and `platform/` use malloc | `llvm-objcopy` cannot rename wasm symbols. Replaced by asm labels in a force-included header (`src/port_web_new.h`), verified in the objects: `JKRHeap.cpp.o` defines `__sms_game_new` etc. and game call sites reference them. |
 | Threads | Every `OSThread` is a host pthread; one emulated CPU, baton passed under a mutex (`platform/os/os_thread.cpp`) | Emscripten pthreads (SharedArrayBuffer workers). Requires a cross-origin isolated page (COOP/COEP headers). `main()` runs on a worker (`PROXY_TO_PTHREAD`) so the game may block like on desktop. **Verified**: the audio DSP thread starts and runs under the scheduler in Chrome. |
 | Disc | `platform/disc` reads `.iso/.gcm/.ciso` with `open`/`pread`; `platform/dvd` serves the FST from it | WasmFS + OPFS backend gives real POSIX `open`/`pread` on a worker. The page copies the image into OPFS once (persists across visits). **Verified** with the unchanged `gcdisc.cpp` and `dvd.cpp`. |
-| Saves | Memory card as files (`platform/card`, `SMS_SAVE_DIR`) | `SMS_SAVE_DIR=/opfs/sms/card-a`: persistent browser storage, same file format. Not yet exercised by a running game. |
+| Saves | Memory card as files (`platform/card`, `SMS_SAVE_DIR`) | `SMS_SAVE_DIR=/opfs/sms/card-a`: persistent browser storage, same file format. **Verified**: the airstrip's Shine saved at the game's prompt, loaded after a reload and a new import of the disc; each file written beside the old one and moved into place (WasmFS rename on OPFS), so a cut save keeps the old file or the new one (`web/tests/play.mjs`). |
 | Graphics | `platform/gx`: GX register model → OpenGL **3.3 core** + GLSL 330; optional GL thread with a command queue (`gx_glthread.*`); SDL2 window or EGL headless | See §3. Renders through the browser WebGL 2 compatibility backend; see the development log. |
 | Input | `platform/pad`: SDL2 keyboard/game controllers, bindings, GameCube adapter via libusb | SDL2's Emscripten port maps keyboard and the Gamepad API; libusb adapter path is native-only. |
 | Audio | DSP HLE + software mixer (`platform/audio`), output through SDL2 audio | Mixer is portable C++. **Done**: the AI output writes a ring of stereo frames in shared wasm memory; `web/shell/audio-worklet.js` plays it at 32 kHz (Atomics, no locks), and a pacing thread does what the SDL callback did (kick the CPU when low, queue more after a dry spell, keep the DAC clock while the context is suspended). SDL2's Emscripten audio (ScriptProcessor on the main thread) is not used. |
@@ -71,6 +71,7 @@ Why not render on the game's worker through OffscreenCanvas: a worker's canvas o
 - Title, **Import GameCube disc image**, local validation (CISO/ISO header, disc magic, `GMSE01`, Rev 0, truncation, RVZ/WIA/GCZ refused with a reason), storage quota check, progress, errors, **Play** enabled only when the browser has everything and a validated image is stored, **Remove stored disc**, canvas, runtime log.
 - The copy runs in a worker with an OPFS sync access handle (works in Chrome, Firefox and Safari); a JSON marker is written only after a complete copy, so an interrupted import is never used.
 - `navigator.storage.persist()` is requested on import.
+- **Play** shows the game alone: `#stage` (the canvas only) goes fullscreen from the click itself and covers the page; the canvas's device-pixel size is handed to the game, which draws the 4:3 picture at that resolution with side bars where needed. Escape returns to the page (the game keeps running); the button then reads **Back to the game**. A refused fullscreen request leaves the game filling the window.
 - `web/serve.py` serves with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`. Any static host (GitHub Pages cannot set headers; Netlify/Cloudflare Pages can, or a `coi-serviceworker`) works the same way.
 
 ## 5. Milestones
@@ -83,10 +84,11 @@ Why not render on the game's worker through OffscreenCanvas: a worker's canvas o
 | 2c | Real disc: game runs at full speed; scripted new game reaches and runs Delfino Plaza (game logic, no picture) | **done, tested** with the user's GMSE01 image (WEB_DEVLOG.md) |
 | 3 | Title screen renders | **done, visually verified** in Chrome/SwiftShader |
 | 4 | Main menu accepts input | **done, visually verified**: browser keyboard through SDL2; title, memory card file creation, file select |
-| 5 | Delfino Plaza loads | **done, visually verified**: new game → Delfino Airstrip; Delfino Plaza (`SMS_WARP=1,0,1`) at 52-60 fps on an Intel iGPU |
-| 6 | Mario moves and interacts | **done, visually verified**: run, jump, swim, goop damage, camera, FLUDD spray and hover |
-| 7 | Audio and saves | **audio done** (AudioWorklet, measured signal); memory card in OPFS creates its file (persisting a saved game not yet checked) |
-| 8 | Other levels, full game | movies (THP decoder is portable), save states (need a wasm replacement for the link-map ranges) |
+| 5 | Delfino Plaza loads | **done, verified**: reached by playing the airstrip from a new game (no warp); Delfino Plaza at 52-60 fps on an Intel iGPU |
+| 6 | Mario moves and interacts | **done, verified**: Delfino Airstrip played through from a new game (scripted input, `web/tests/airstrip.input`): FLUDD found, its tutorial, goop cleaned, the goop Piranha Plant beaten, the Shine, the trial, Delfino Plaza |
+| 7 | Audio and saves | **done**: audio (AudioWorklet, measured signal); a game saved at the Shine's prompt and loaded back after a reload (`web/tests/play.mjs`) |
+| 7b | Game-only fullscreen | **done, tested**: Play makes the canvas's stage fullscreen at the screen's resolution, 4:3 with side bars, page hidden; Escape returns, Play goes back; refused fullscreen fills the window |
+| 8 | Other levels, full game | movies play (THP, verified on the airstrip and in the plaza); other levels not played; save states (need a wasm replacement for the link-map ranges) |
 
 ## 6. Known blockers and trade-offs
 
